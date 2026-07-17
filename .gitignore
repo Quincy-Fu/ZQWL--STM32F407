@@ -1,0 +1,42 @@
+# Keil MDK 编译中间文件
+*.o
+*.d
+*.crf
+*.iex
+*.lnp
+*.htm
+*.map
+*.sct
+*.dep
+*.axf
+*.hex
+*.bin
+*.elf
+*.lst
+
+# Keil 用户特定配置（含 GUI 状态、断点等，每个人不同）
+*.uvguix.*
+*.uvoptx
+*.uvopt
+*.bak
+*.sav
+
+# Keil 编译输出文件夹（每次编译重新生成）
+MDK-ARM/DebugConfig/
+MDK-ARM/Listings/
+MDK-ARM/Objects/
+MDK-ARM/RTE/
+MDK-ARM/zqwl_bot_ws/
+
+# CubeMX 生成的临时备份
+*.mxproject.bak
+
+# IDE 临时
+*.swp
+*~
+.vscode/
+.idea/
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
