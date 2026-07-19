@@ -61,9 +61,10 @@ static void parse_frame(uint8_t func, const uint8_t *data, uint8_t data_len)
 {
     switch (func) {
         case IMU_FUNC_EULER:
-            /* roll @ data[0..3], pitch @ data[4..7], yaw @ data[8..11] */
+            /* roll @ data[0..3], pitch @ data[4..7], yaw @ data[8..11]
+             * IMU 上报弧度, 转成角度存 (g_imu_yaw 单位度, 更直观) */
             if (data_len >= 12) {
-                s_yaw = to_float(&data[8]);
+                s_yaw = to_float(&data[8]) * 57.2957795f;
             }
             break;
         /* 其他功能码暂不解析 (用户只要 yaw, YAGNI) */

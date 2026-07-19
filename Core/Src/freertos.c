@@ -45,7 +45,7 @@
 #define WHEEL_DIAMETER_M       0.065f    // 轮径 65mm (实测)
 #define WHEEL_RADIUS_M         (WHEEL_DIAMETER_M * 0.5f)
 #define WHEEL_BASE_HALF_X_M    0.085f    // 半轴�????(前后) 85mm
-#define WHEEL_BASE_HALF_Y_M    0.125f    // 半轴�????(左右) 125mm
+#define WHEEL_BASE_HALF_Y_M    0.085f    // 半轮距 85mm (全轮距 170mm)
 #define L_SUM_M                (WHEEL_BASE_HALF_X_M + WHEEL_BASE_HALF_Y_M)
 
 // 单位换算: m/s �???? 轮子 RPM
@@ -359,16 +359,16 @@ void StartOdomTask(void const * argument)
         // 麦轮正运动学 (base_link 坐标系增�???)
         float dx_body = (d_FL + d_FR + d_RL + d_RR) * 0.25f;
         float dy_body = (-d_FL + d_FR + d_RL - d_RR) * 0.25f;
-        float dtheta  = (-d_FL + d_FR - d_RL + d_RR) / (4.0f * L_SUM_M);
+        float cur_theta = g_imu_yaw * 0.01745329f;  // ponytail: g_imu_yaw 是角度, cosf/sinf 要弧度, deg->rad
 
         // 旋转到世界系累加 (用本周期�???始时�??? theta)
-        float ct = cosf(g_odom_theta);
-        float st = sinf(g_odom_theta);
+        float ct = cosf(cur_theta);
+        float st = sinf(cur_theta);
         // 临界�???: 写两个全�???变量中间别被插队�???, �???单关中断
         __disable_irq();
         g_odom_x     += dx_body * ct - dy_body * st;
         g_odom_y     += dx_body * st + dy_body * ct;
-        g_odom_theta += dtheta;
+        g_odom_theta  = cur_theta;  // 直接覆盖, 不累加
         __enable_irq();
       }
 
@@ -406,6 +406,7 @@ void StartOptFlowTask(void const * argument)
 
   int16_t dx_pix, dy_pix;
   uint8_t squal, obs;
+  static float last_yaw = 0.0f;  // ponytail: for turn detection
 
   for(;;) {
     // 1. �? motion burst 12 字节
@@ -417,15 +418,18 @@ void StartOptFlowTask(void const * argument)
 
     // 3. 只在 observation 正常 + squal 够高时采�? (datasheet 7.2)
     if (obs == PMW_OBSERVATION_OK && squal >= PMW_SQUAL_MIN) {
-      // 光流输出方向: 车移动→地面反向→光流输出反�?, 取反
-      // 安装: X 朝前 Y 朝左
-      float dx_m = -dx_pix * PMW_PIX_TO_M;
-      float dy_m = -dy_pix * PMW_PIX_TO_M;
-      // 临界�?: 写两个全�? float 中间别被插队�?
-      __disable_irq();
-      g_optflow_x += dx_m;
-      g_optflow_y += dy_m;
-      __enable_irq();
+      // ponytail: turn segment disables optical flow (off-center install causes false motion)
+      //   |d_yaw| > 0.02 rad (~1.1 deg) = turning, drop frame
+      float d_yaw = g_imu_yaw - last_yaw;
+      last_yaw = g_imu_yaw;
+      if (fabsf(d_yaw) < 1.1f) {  // ~1.1 deg = 0.02 rad, smaller = straight
+        float dx_m = -dx_pix * PMW_PIX_TO_M;
+        float dy_m = -dy_pix * PMW_PIX_TO_M;
+        __disable_irq();
+        g_optflow_x += dx_m;
+        g_optflow_y += dy_m;
+        __enable_irq();
+      }
     }
     // obs != 0xBF �? squal < 0x19 时丢弃本�? (光流表面纹理不够或异�?)
 
