@@ -16,4 +16,13 @@
 /* 启动 USART1 接收 (任务里调一次, 之后回调自动维持) */
 void imu_uart_start_rx(void);
 
+/* Send a command frame to IMU: [0x7E][0x23][len][func][params][checksum] */
+void imu_uart_send_cmd(uint8_t func, const uint8_t *params, uint8_t param_len);
+
+/* Switch IMU to 6-axis mode (gyro + accel, no magnetometer) */
+void imu_uart_set_6axis(void);
+
+/* Trigger IMU gyro calibration (IMU must be stationary, takes up to 7s) */
+void imu_uart_calibrate_imu(void);
+
 #endif /* __IMU_UART_H */

@@ -29,6 +29,11 @@
 #define IMU_FUNC_BARO         0x32
 #define IMU_FUNC_RETURN_STATE 0x81
 
+/* Command function codes (MCU -> IMU) */
+#define IMU_FUNC_SET_OUTPUT_FREQ 0x60   /* param: freq (10-100 Hz) */
+#define IMU_FUNC_SET_ALGO_TYPE   0x61   /* param: 0x06=6-axis, 0x09=9-axis, + 0x5F */
+#define IMU_FUNC_CALIB_IMU       0x70   /* param: 0x01, 0x5F; IMU must be stationary */
+
 #define IMU_RX_BUF_SIZE 256
 
 /* ISR 调用: 推 1 字节到环形缓冲 */
@@ -45,5 +50,6 @@ extern volatile uint8_t  imu_last_func;          /* 最近一帧的功能码 */
 extern volatile uint32_t imu_frame_count;        /* 校验通过的帧计数 */
 extern volatile uint8_t  imu_last_checksum_ok;    /* 最近一帧校验结果 */
 extern volatile uint32_t imu_rx_byte_count;      /* 收到的总字节数 (调试用) */
+extern volatile float    imu_raw_yaw;            /* 原始 yaw (转换前, 确认单位用) */
 
 #endif /* __IMU_PROTOCOL_H */

@@ -27,6 +27,7 @@ volatile uint8_t  imu_last_func         = 0;
 volatile uint32_t imu_frame_count       = 0;
 volatile uint8_t  imu_last_checksum_ok  = 0;
 volatile uint32_t imu_rx_byte_count     = 0;   // total bytes received (debug)
+volatile float    imu_raw_yaw           = 0.0f; // raw yaw before conversion (debug)
 
 /* ---- 环形缓冲接口 ---- */
 
@@ -66,7 +67,9 @@ static void parse_frame(uint8_t func, const uint8_t *data, uint8_t data_len)
             /* roll @ data[0..3], pitch @ data[4..7], yaw @ data[8..11]
              * IMU 上报弧度, 转成角度存 (g_imu_yaw 单位度, 更直观) */
             if (data_len >= 12) {
-                s_yaw = to_float(&data[8]) * 57.2957795f;
+                float raw = to_float(&data[8]);
+                imu_raw_yaw = raw;  /* debug: check if ~1.57 for 90deg (radians) or ~90 (degrees) */
+                s_yaw = raw * 57.2957795f;
             }
             break;
         /* 其他功能码暂不解析 (用户只要 yaw, YAGNI) */

@@ -108,6 +108,11 @@ volatile float g_optflow_y = 0.0f;
 volatile bool    g_optflow_init_ok = false;   // pmw3901_init 返回�???
 volatile uint8_t g_optflow_obs     = 0;       // �???近一�??? observation (�??? 0xBF)
 volatile uint8_t g_optflow_squal   = 0;       // �???近一�??? squal (表面质量)
+volatile int16_t g_optflow_last_dx_pix = 0;    // last frame raw pixel delta X (debug, not reset)
+volatile int16_t g_optflow_last_dy_pix = 0;    // last frame raw pixel delta Y (debug, not reset)
+volatile float   g_optflow_last_dx_m   = 0.0f; // last frame dx in meters (debug, not reset)
+volatile float   g_optflow_last_dy_m   = 0.0f; // last frame dy in meters (debug, not reset)
+volatile uint32_t g_optflow_frame_count = 0;   // valid frame counter (debug)
 
 // IMU 朝向�? (ImuTask �?, 后续融合�? g_odom_theta)
 // 单位待实测确�?: 弧度 or 角度 (假设弧度, 例程写法)
@@ -266,6 +271,7 @@ void StartTask02(void const * argument)
 
   // 上电延时2s等待电机初始化完�???
   osDelay(2000);
+
 
   // 初始�??? PMW3901 光流 (失败不阻�???, MotorTask 继续; OptFlowTask �??? g_optflow_init_ok 决定挂起)
   g_optflow_init_ok = pmw3901_init();  
@@ -499,9 +505,11 @@ void StartOptFlowTask(void const * argument)
     // 1. �?? motion burst 12 字节
     pmw3901_read_motion(&dx_pix, &dy_pix, &squal, &obs);
 
-    // 2. 暴露调试状�?? (Keil 在线调试器看)
+    // 2. Expose debug state (Keil debugger)
     g_optflow_obs   = obs;
     g_optflow_squal = squal;
+    g_optflow_last_dx_pix = dx_pix;   // raw pixel delta, always updated
+    g_optflow_last_dy_pix = dy_pix;
 
     // 3. 只在 observation 正常 + squal 够高时采�?? (datasheet 7.2)
     if (obs == PMW_OBSERVATION_OK && squal >= PMW_SQUAL_MIN) {
@@ -517,6 +525,9 @@ void StartOptFlowTask(void const * argument)
         g_optflow_dy += dy_m;
         g_optflow_x  += dx_m;   // running total for display
         g_optflow_y  += dy_m;
+        g_optflow_last_dx_m = dx_m;   // per-frame debug (not reset by OdomTask)
+        g_optflow_last_dy_m = dy_m;
+        g_optflow_frame_count++;
         __enable_irq();
       }
     }

@@ -87,4 +87,8 @@ bool pmw3901_init(void);
  */
 void pmw3901_read_motion(int16_t *dx, int16_t *dy, uint8_t *squal, uint8_t *obs);
 
+/* Init debug variables (Keil Watch) */
+extern volatile uint8_t pmw_init_step;     /* 0=not run, 1=ProdID, 2=InvProdID, 3=OptRegs, 4=Obs, 0xFF=OK */
+extern volatile uint8_t pmw_debug_reg_val; /* actual register value read at failing step */
+
 #endif /* __PMW3901_H */

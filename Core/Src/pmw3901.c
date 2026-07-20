@@ -1,6 +1,13 @@
 #include "pmw3901.h"
 #include "spi.h"
 
+/* Init debug: check these in Keil Watch when pmw3901_init() fails
+ * pmw_init_step: 0=not run, 1=ProductID fail, 2=InvProductID fail,
+ *                3=OptRegs fail, 4=Observation fail, 0xFF=success
+ * pmw_debug_reg_val: actual value read from the failing register */
+volatile uint8_t pmw_init_step    = 0;
+volatile uint8_t pmw_debug_reg_val = 0;
+
 /* ============================================================
  * PMW3901MB-TXQT 光流传感器驱动
  * 严格依据 datasheet POT0189-PMW3901MB-TXQT-DS-R1.10
@@ -216,6 +223,8 @@ static bool pmw3901_init_opt_regs(void)
 
 bool pmw3901_init(void)
 {
+    pmw_init_step = 0;
+
     /* 1. NCS 高→低 复位 SPI 端口 */
     PMW_CS_HIGH();
     HAL_Delay(1);
@@ -225,8 +234,13 @@ bool pmw3901_init(void)
     HAL_Delay(1);
 
     /* 2. 验证 SPI 通: 读 Product_ID 应 0x49, Inverse_Product_ID 应 0xB6 */
-    if (pmw3901_read_reg(PMW_REG_PRODUCT_ID) != PMW_PRODUCT_ID_VAL) return false;
-    if (pmw3901_read_reg(PMW_REG_INV_PRODUCT_ID) != PMW_INV_PRODUCT_ID_VAL) return false;
+    pmw_init_step = 1;
+    pmw_debug_reg_val = pmw3901_read_reg(PMW_REG_PRODUCT_ID);
+    if (pmw_debug_reg_val != PMW_PRODUCT_ID_VAL) return false;
+
+    pmw_init_step = 2;
+    pmw_debug_reg_val = pmw3901_read_reg(PMW_REG_INV_PRODUCT_ID);
+    if (pmw_debug_reg_val != PMW_INV_PRODUCT_ID_VAL) return false;
 
     /* 3. 写 0x5A 到 Power_Up_Reset 寄存器 */
     pmw3901_write_reg(PMW_REG_POWER_UP_RESET, 0x5A);
@@ -240,12 +254,16 @@ bool pmw3901_init(void)
     pmw3901_read_reg(0x06);
 
     /* 5. Performance Optimization Registers */
+    pmw_init_step = 3;
     if (!pmw3901_init_opt_regs()) return false;
 
     /* 6. 验证 Observation: 写 0x00 等 15ms 读应 0xBF */
+    pmw_init_step = 4;
     pmw3901_write_reg(PMW_REG_OBSERVATION, 0x00);
     HAL_Delay(15);
-    if (pmw3901_read_reg(PMW_REG_OBSERVATION) != PMW_OBSERVATION_OK) return false;
+    pmw_debug_reg_val = pmw3901_read_reg(PMW_REG_OBSERVATION);
+    if (pmw_debug_reg_val != PMW_OBSERVATION_OK) return false;
 
+    pmw_init_step = 0xFF;  /* success */
     return true;
 }
