@@ -26,11 +26,13 @@ static volatile float s_yaw = 0.0f;
 volatile uint8_t  imu_last_func         = 0;
 volatile uint32_t imu_frame_count       = 0;
 volatile uint8_t  imu_last_checksum_ok  = 0;
+volatile uint32_t imu_rx_byte_count     = 0;   // total bytes received (debug)
 
 /* ---- 环形缓冲接口 ---- */
 
 void imu_protocol_push_byte(uint8_t b)
 {
+    imu_rx_byte_count++;
     s_rx_buf[s_rx_write] = b;
     uint16_t next = (uint16_t)((s_rx_write + 1) % IMU_RX_BUF_SIZE);
     /* 缓冲满时丢弃最旧字节 */

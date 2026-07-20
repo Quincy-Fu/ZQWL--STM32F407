@@ -44,5 +44,6 @@ bool imu_protocol_get_yaw(float *out);
 extern volatile uint8_t  imu_last_func;          /* 最近一帧的功能码 */
 extern volatile uint32_t imu_frame_count;        /* 校验通过的帧计数 */
 extern volatile uint8_t  imu_last_checksum_ok;    /* 最近一帧校验结果 */
+extern volatile uint32_t imu_rx_byte_count;      /* 收到的总字节数 (调试用) */
 
 #endif /* __IMU_PROTOCOL_H */

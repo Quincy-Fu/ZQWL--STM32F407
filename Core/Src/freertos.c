@@ -58,8 +58,24 @@
 // omega:  rad/s × 100
 #define SPD_SCALE              100.0f
 
-// Emm_V5.0 速度上限
+// Emm_V5.0 speed limit
 #define MOTOR_VEL_LIMIT       5000
+
+// ===== Position control parameters =====
+#define POS_KP_XY      2.0f    // P gain: m/s per m position error
+#define POS_KP_THETA   2.0f    // P gain: rad/s per rad heading error
+#define POS_DEAD_XY    0.02f   // 2cm deadband
+#define POS_DEAD_TH    0.05f   // ~3deg deadband
+#define POS_VMAX_XY    0.5f    // max translational speed (m/s)
+#define POS_VMAX_W     1.5f    // max rotational speed (rad/s)
+
+// ===== Optical flow fusion =====
+#define OPTFLOW_WEIGHT  0.4f   // blend: 0=all encoder, 1=all optflow
+#define TURN_THRESH_RAD 0.05f  // yaw change threshold for turn detect (~3deg)
+
+// ===== IMU verification =====
+#define IMU_VERIFY_FRAMES  10     // min valid frames to confirm IMU OK
+#define IMU_VERIFY_TIMEOUT 10000  // 10s timeout (ms)
 
 /* USER CODE END PD */
 
@@ -97,6 +113,22 @@ volatile uint8_t g_optflow_squal   = 0;       // �???近一�??? squal (表�
 // 单位待实测确�?: 弧度 or 角度 (假设弧度, 例程写法)
 // 上电归零, 相对�?机朝�?
 volatile float g_imu_yaw = 0.0f;
+
+// Optical flow delta since last odom read (body frame, meters)
+// OptFlowTask accumulates here, OdomTask reads and resets each cycle
+volatile float g_optflow_dx = 0.0f;
+volatile float g_optflow_dy = 0.0f;
+
+// Position control target (world frame)
+// Set by CommTask (future) or Keil debugger for testing
+volatile float g_tgt_x     = 0.0f;   // target x (m)
+volatile float g_tgt_y     = 0.0f;   // target y (m)
+volatile float g_tgt_theta = 0.0f;   // target heading (rad)
+volatile uint8_t g_pos_mode    = 0;  // 0=velocity mode, 1=position mode
+volatile uint8_t g_pos_reached = 0;  // 1=target reached
+
+// IMU verification: set to 1 when enough valid frames received
+volatile uint8_t g_imu_verified = 0;
 
 /* USER CODE END Variables */
 osThreadId defaultTaskHandle;
@@ -206,9 +238,7 @@ void MX_FREERTOS_Init(void) {
 /* USER CODE END Header_StartDefaultTask */
 void StartDefaultTask(void const * argument)
 {
-  /* USER CODE BEGIN StartDefaultTask */
-
-  // defaultTask 现在空循�?????, 后续可改造成 MonitorTask (心跳/看门�?????/调试日志)
+    /* USER CODE BEGIN StartDefaultTask */
   /* Infinite loop */
   for(;;)
   {
@@ -240,57 +270,82 @@ void StartTask02(void const * argument)
   // 初始�??? PMW3901 光流 (失败不阻�???, MotorTask 继续; OptFlowTask �??? g_optflow_init_ok 决定挂起)
   g_optflow_init_ok = pmw3901_init();  
 
-  // 时序测试: 左移6s �????? 右移6s �????? 旋转6s �????? 停止
-  // 单位: vx,vy = m/s×100, omega = rad/s×100
-  // 旋转�????? omega=100(1 rad/s), 6秒转�?????6弧度�?????344°, 接近�?????�?????
-  // 里程计反馈测�?????: 直行0.5m �????? 原地�?????90° �????? �?????
-  // 验证: 量车实际走位, 接近 0.5m �????? 90° = 里程计对
-  int phase = 0;
-  float theta0 = 0.0f;   // 阶段2 �?????始时�????? theta
+  // --- IMU verification: wait for valid frames before starting ---
+  // DisplayTask shows IMU status on LCD during this wait
+  {
+    uint32_t t0 = HAL_GetTick();
+    while (!g_imu_verified) {
+      if (HAL_GetTick() - t0 > IMU_VERIFY_TIMEOUT) {
+        break;  // timeout: proceed without IMU (encoder-only theta)
+      }
+      osDelay(100);
+    }
+  }
+
+  // Main control loop: position mode or velocity mode
   for(;;) {
-    // 1. 基于里程计反馈的阶段切换
-    switch (phase) {
-    case 0:  // 阶段1: 直行 0.2 m/s, 走够 0.5 m 切阶�?????2
-      g_tgt_vx = 20;  g_tgt_vy = 0;  g_tgt_omega = 0;
-      if (g_odom_x >= 0.5f) {
-        phase = 1;
-        theta0 = g_odom_theta;   // 记录转圈起始 theta
+    float vx, vy, w;
+
+    if (g_pos_mode) {
+      // --- Position control mode ---
+      // P controller: world-frame position error -> world-frame velocity
+      float ex  = g_tgt_x - g_odom_x;
+      float ey  = g_tgt_y - g_odom_y;
+      float eth = g_tgt_theta - g_odom_theta;
+      // Normalize theta error to [-pi, pi]
+      while (eth >  3.14159265f) eth -= 6.28318530f;
+      while (eth < -3.14159265f) eth += 6.28318530f;
+
+      // Deadband: zero out small errors to avoid jitter
+      if (fabsf(ex)  < POS_DEAD_XY) ex  = 0.0f;
+      if (fabsf(ey)  < POS_DEAD_XY) ey  = 0.0f;
+      if (fabsf(eth) < POS_DEAD_TH) eth = 0.0f;
+
+      // Reached flag
+      g_pos_reached = (ex == 0.0f && ey == 0.0f && eth == 0.0f) ? 1 : 0;
+
+      // World-frame P controller
+      float vx_w = POS_KP_XY * ex;
+      float vy_w = POS_KP_XY * ey;
+      w = POS_KP_THETA * eth;
+
+      // Rotate world-frame velocity to body frame
+      float ct = cosf(g_odom_theta);
+      float st = sinf(g_odom_theta);
+      vx =  vx_w * ct + vy_w * st;
+      vy = -vx_w * st + vy_w * ct;
+
+      // Velocity limits
+      float v_mag = sqrtf(vx * vx + vy * vy);
+      if (v_mag > POS_VMAX_XY) {
+        float scale = POS_VMAX_XY / v_mag;
+        vx *= scale;
+        vy *= scale;
       }
-      break;
-    case 1:  // 阶段2: 原地 CCW �?????, 转够 π/2 (90°) 切阶�?????3
-      g_tgt_vx = 0;  g_tgt_vy = 0;  g_tgt_omega = 100;
-      if (g_odom_theta - theta0 >= 1.5708f) {  // π/2
-        phase = 2;
-      }
-      break;
-    case 2:  // 阶段3: 停止
-    default:
-      g_tgt_vx = 0;  g_tgt_vy = 0;  g_tgt_omega = 0;
-      break;
+      if (w >  POS_VMAX_W) w =  POS_VMAX_W;
+      if (w < -POS_VMAX_W) w = -POS_VMAX_W;
+    } else {
+      // --- Velocity control mode ---
+      // g_tgt_vx/vy/omega set by CommTask (future) or Keil debugger
+      vx = g_tgt_vx    / SPD_SCALE;
+      vy = g_tgt_vy    / SPD_SCALE;
+      w  = g_tgt_omega / SPD_SCALE;
     }
 
-    // 2. 读目标�?�度 (int16×100 �????? float m/s, rad/s)
-    float vx = g_tgt_vx / SPD_SCALE;
-    float vy = g_tgt_vy / SPD_SCALE;
-    float w  = g_tgt_omega / SPD_SCALE;
-
-    // 2. X型麦轮�?�运动学 (base_link 坐标�?????)
-    //    �????? vx = 前进, �????? vy = 左移, �????? w = CCW(逆时�?????)
-    //    算的�?????"车体视角的轮�????? RPM", �?????=车前进方�?????
-    //    motor_emit �????? is_right 参数会处理右侧镜像安�?????, 这里不再取负
+    // Inverse kinematics: body velocity -> 4 wheel RPM
+    // vx=forward, vy=left, w=CCW; motor_emit handles right-side mirror
     float rpm_FL = (vx - vy - L_SUM_M * w) * RPM_PER_MPS;
     float rpm_FR = (vx + vy + L_SUM_M * w) * RPM_PER_MPS;
     float rpm_RL = (vx + vy - L_SUM_M * w) * RPM_PER_MPS;
     float rpm_RR = (vx - vy + L_SUM_M * w) * RPM_PER_MPS;
 
-    // 3. �????? CAN 命令 (每条�?????10ms防电机端漏收, 详见 WHEEL_DIRECTION.md)
-    //    左侧正→dir=0(CW=前进)  右侧正→dir=1(CCW=前进, 因镜像安�?????)
+    // Send CAN commands (10ms spacing to prevent frame loss)
     motor_emit(MOTOR_FL, rpm_FL, false); osDelay(10);
     motor_emit(MOTOR_FR, rpm_FR, true);  osDelay(10);
     motor_emit(MOTOR_RL, rpm_RL, false); osDelay(10);
     motor_emit(MOTOR_RR, rpm_RR, true);  osDelay(10);
 
-    osDelay(50);  // 周期 ~100ms (4×10ms 发命�????? + 50ms 让出 + 余量)
+    osDelay(50);  // ~100ms cycle
   }
   /* USER CODE END StartTask02 */
 }
@@ -316,6 +371,7 @@ void StartOdomTask(void const * argument)
   int32_t cur_pos[4]  = {0, 0, 0, 0};
   bool has_last = false;          // 首轮无法算增�????, 只填 last_pos
   uint8_t cur_motor = 0;          // 当前正在读的电机索引 0..3
+  float last_theta = 0.0f;        // previous IMU theta for turn detection
 
   // 等电机就�???? (MotorTask 里也�???? 2s 等待, 这里再等 500ms 错峰)
   osDelay(2500);
@@ -368,6 +424,29 @@ void StartOdomTask(void const * argument)
         float dx_body = (d_FL + d_FR + d_RL + d_RR) * 0.25f;
         float dy_body = (-d_FL + d_FR + d_RL - d_RR) * 0.25f;
         float cur_theta = g_imu_yaw * 0.01745329f;  // ponytail: g_imu_yaw 是角�?, cosf/sinf 要弧�?, deg->rad
+
+        // --- Optical flow fusion ---
+        // Read and reset optical flow delta (accumulated by OptFlowTask)
+        float of_dx, of_dy;
+        __disable_irq();
+        of_dx = g_optflow_dx;
+        of_dy = g_optflow_dy;
+        g_optflow_dx = 0.0f;
+        g_optflow_dy = 0.0f;
+        __enable_irq();
+
+        // Turn detection: if yaw changed significantly, discard optical flow
+        float d_theta = cur_theta - last_theta;
+        while (d_theta >  3.14159265f) d_theta -= 6.28318530f;
+        while (d_theta < -3.14159265f) d_theta += 6.28318530f;
+
+        if (fabsf(d_theta) < TURN_THRESH_RAD && g_optflow_init_ok) {
+            // Straight segment: blend encoder + optical flow
+            dx_body = (1.0f - OPTFLOW_WEIGHT) * dx_body + OPTFLOW_WEIGHT * of_dx;
+            dy_body = (1.0f - OPTFLOW_WEIGHT) * dy_body + OPTFLOW_WEIGHT * of_dy;
+        }
+        // else: turning, use encoder only (optflow delta already reset/discarded)
+        last_theta = cur_theta;
 
         // 旋转到世界系累加 (用本周期�????始时�???? theta)
         float ct = cosf(cur_theta);
@@ -434,8 +513,10 @@ void StartOptFlowTask(void const * argument)
         float dx_m = -dx_pix * PMW_PIX_TO_M;
         float dy_m = -dy_pix * PMW_PIX_TO_M;
         __disable_irq();
-        g_optflow_x += dx_m;
-        g_optflow_y += dy_m;
+        g_optflow_dx += dx_m;   // delta for OdomTask fusion
+        g_optflow_dy += dy_m;
+        g_optflow_x  += dx_m;   // running total for display
+        g_optflow_y  += dy_m;
         __enable_irq();
       }
     }
@@ -475,6 +556,11 @@ void StartImuTask(void const * argument)
       __enable_irq();
     }
 
+    // IMU verification: set flag when enough valid frames received
+    if (!g_imu_verified && imu_frame_count >= IMU_VERIFY_FRAMES) {
+      g_imu_verified = 1;
+    }
+
     osDelay(10);  // 100Hz 解析 (IMU 25Hz 上报, 100Hz 解析�?)
   }
   /* USER CODE END StartImuTask */
@@ -493,12 +579,13 @@ void StartDisplayTask(void const * argument)
   LCD_Init();
   LCD_Clear(LCD_BLACK);
 
-  char buf[32];
+  char buf[40];
   for(;;)
   {
-    // snapshot odometer
-    float ox, oy, ot, iy, ofx, ofy;
-    uint8_t squal;
+    // Snapshot all shared variables
+    float ox, oy, ot, iy, ofx, ofy, tx, ty, tt;
+    uint8_t squal, imu_ok, pos_mode, pos_reached;
+    uint32_t fc;
     __disable_irq();
     ox  = g_odom_x;
     oy  = g_odom_y;
@@ -507,31 +594,58 @@ void StartDisplayTask(void const * argument)
     ofx = g_optflow_x;
     ofy = g_optflow_y;
     squal = g_optflow_squal;
+    imu_ok = g_imu_verified;
+    fc = imu_frame_count;
+    tx = g_tgt_x;
+    ty = g_tgt_y;
+    tt = g_tgt_theta;
+    pos_mode = g_pos_mode;
+    pos_reached = g_pos_reached;
     __enable_irq();
 
-    // row 0 — title
+    // Title
     LCD_Print(10, 10, "===== ZQWL ODOMETRY =====", LCD_CYAN, LCD_BLACK);
 
-    // row 2 — encoder odom
-    LCD_Print(10, 50, "ODOM:", LCD_WHITE, LCD_BLACK);
+    // IMU status (most important for first-time verification)
+    if (imu_ok) {
+      snprintf(buf, sizeof(buf), "IMU: OK  FC:%lu", (unsigned long)fc);
+      LCD_Print(10, 40, buf, LCD_GREEN, LCD_BLACK);
+    } else {
+      snprintf(buf, sizeof(buf), "IMU: WAIT  FC:%lu", (unsigned long)fc);
+      LCD_Print(10, 40, buf, LCD_RED, LCD_BLACK);
+    }
+    snprintf(buf, sizeof(buf), "IMU YAW: %+.2f DEG", (double)iy);
+    LCD_Print(10, 60, buf, LCD_YELLOW, LCD_BLACK);
+
+    // Encoder odometry
+    LCD_Print(10, 90, "ODOM:", LCD_WHITE, LCD_BLACK);
     snprintf(buf, sizeof(buf), "X:%+.3f Y:%+.3f", (double)ox, (double)oy);
-    LCD_Print(10, 70, buf, LCD_WHITE, LCD_BLACK);
-    snprintf(buf, sizeof(buf), "Theta: %+.3f rad", (double)ot);
-    LCD_Print(10, 90, buf, LCD_WHITE, LCD_BLACK);
+    LCD_Print(10, 110, buf, LCD_WHITE, LCD_BLACK);
+    snprintf(buf, sizeof(buf), "THETA: %+.3f RAD", (double)ot);
+    LCD_Print(10, 130, buf, LCD_WHITE, LCD_BLACK);
 
-    // row 5 — IMU
-    snprintf(buf, sizeof(buf), "IMU Yaw: %+.2f deg", (double)iy);
-    LCD_Print(10, 120, buf, LCD_YELLOW, LCD_BLACK);
+    // Optical flow
+    snprintf(buf, sizeof(buf), "OPTF: X:%+.3f Y:%+.3f", (double)ofx, (double)ofy);
+    LCD_Print(10, 160, buf, LCD_GREEN, LCD_BLACK);
+    snprintf(buf, sizeof(buf), "SQUAL: 0x%02X", squal);
+    LCD_Print(10, 180, buf, LCD_GREEN, LCD_BLACK);
 
-    // row 7 — optflow
-    snprintf(buf, sizeof(buf), "OptF: X:%+.3f Y:%+.3f", (double)ofx, (double)ofy);
-    LCD_Print(10, 150, buf, LCD_GREEN, LCD_BLACK);
-    snprintf(buf, sizeof(buf), "Squal: 0x%02X", squal);
-    LCD_Print(10, 170, buf, LCD_GREEN, LCD_BLACK);
+    // Position control status
+    if (pos_mode) {
+      snprintf(buf, sizeof(buf), "POS TGT: %+.2f %+.2f %+.2f", (double)tx, (double)ty, (double)tt);
+      LCD_Print(10, 210, buf, LCD_MAGENTA, LCD_BLACK);
+      float ex = tx - ox, ey = ty - oy;
+      snprintf(buf, sizeof(buf), "ERR: %+.3f %+.3f %s", (double)ex, (double)ey,
+               pos_reached ? "REACHED" : "MOVING");
+      LCD_Print(10, 230, buf, pos_reached ? LCD_GREEN : LCD_MAGENTA, LCD_BLACK);
+    } else {
+      LCD_Print(10, 210, "MODE: VELOCITY", LCD_GRAY, LCD_BLACK);
+      LCD_Print(10, 230, "SET G_POS_MODE=1 FOR POS", LCD_GRAY, LCD_BLACK);
+    }
 
     osDelay(200);  // ~5 Hz
   }
-  /* USER CODE END StartDisplayTask */
+    /* USER CODE END StartDisplayTask */
 }
 
 /* Private application code --------------------------------------------------*/
