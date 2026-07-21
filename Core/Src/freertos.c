@@ -236,39 +236,13 @@ void StartTask02(void const * argument)
 {
   /* USER CODE BEGIN StartTask02 */
 
-  // Enable 4 motor drivers (required: un-enabled motors ignore velocity commands)
-  Emm_V5_En_Control(MOTOR_FL, true, false); osDelay(10);
-  Emm_V5_En_Control(MOTOR_FR, true, false); osDelay(10);
-  Emm_V5_En_Control(MOTOR_RL, true, false); osDelay(10);
-  Emm_V5_En_Control(MOTOR_RR, true, false); osDelay(100);
-
-  // Wait for motor driver initialization
-  osDelay(2000);
-
-  // Velocity control loop
-  // g_tgt_vx/vy/omega set by CommTask (future) or Keil debugger
+  // Motor test disabled: do not enable drivers, do not send velocity commands
+  // To re-enable: restore Emm_V5_En_Control + velocity loop
   for(;;) {
-    float vx = g_tgt_vx    / SPD_SCALE;   // m/s
-    float vy = g_tgt_vy    / SPD_SCALE;   // m/s
-    float w  = g_tgt_omega / SPD_SCALE;   // rad/s
-
-    // Inverse kinematics: body velocity -> 4 wheel RPM
-    // vx=forward, vy=left, w=CCW; motor_emit handles right-side mirror
-    float rpm_FL = (vx - vy - L_SUM_M * w) * RPM_PER_MPS;
-    float rpm_FR = (vx + vy + L_SUM_M * w) * RPM_PER_MPS;
-    float rpm_RL = (vx + vy - L_SUM_M * w) * RPM_PER_MPS;
-    float rpm_RR = (vx - vy + L_SUM_M * w) * RPM_PER_MPS;
-
-    // Send CAN commands (10ms spacing to prevent frame loss)
-    motor_emit(MOTOR_FL, rpm_FL, false); osDelay(10);
-    motor_emit(MOTOR_FR, rpm_FR, true);  osDelay(10);
-    motor_emit(MOTOR_RL, rpm_RL, false); osDelay(10);
-    motor_emit(MOTOR_RR, rpm_RR, true);  osDelay(10);
-
-    osDelay(50);  // ~100ms cycle
+    osDelay(100);
   }
 
-  /* USER CODE END StartTask02 */
+/* USER CODE END StartTask02 */
 }
 
 /* USER CODE BEGIN Header_StartOdomTask */
@@ -431,8 +405,8 @@ void StartImuTask(void const * argument)
 void StartDisplayTask(void const * argument)
 {
   /* USER CODE BEGIN StartDisplayTask */
-
   LCD_Init();
+
   LCD_Clear(LCD_BLACK);
 
   char buf[40];
@@ -450,7 +424,7 @@ void StartDisplayTask(void const * argument)
     fc = imu_frame_count;
     __enable_irq();
 
-    LCD_Print(10, 10, "===== ZQWL ODOMETRY =====", LCD_CYAN, LCD_BLACK);
+    LCD_Print(10, 10, "-- ZQWL ODOMETRY --", LCD_CYAN, LCD_BLACK);
 
     if (imu_ok) {
       snprintf(buf, sizeof(buf), "IMU: OK  FC:%lu", (unsigned long)fc);
@@ -459,19 +433,19 @@ void StartDisplayTask(void const * argument)
       snprintf(buf, sizeof(buf), "IMU: WAIT  FC:%lu", (unsigned long)fc);
       LCD_Print(10, 40, buf, LCD_RED, LCD_BLACK);
     }
-    snprintf(buf, sizeof(buf), "YAW: %+.2f DEG", (double)iy);
+    snprintf(buf, sizeof(buf), "YAW: %.2f DEG", (double)iy);
     LCD_Print(10, 60, buf, LCD_YELLOW, LCD_BLACK);
 
     LCD_Print(10, 90, "ODOM:", LCD_WHITE, LCD_BLACK);
-    snprintf(buf, sizeof(buf), "X:%+.3f Y:%+.3f", (double)ox, (double)oy);
+    snprintf(buf, sizeof(buf), "X:%.3f Y:%.3f", (double)ox, (double)oy);
     LCD_Print(10, 110, buf, LCD_WHITE, LCD_BLACK);
-    snprintf(buf, sizeof(buf), "THETA: %+.3f RAD", (double)ot);
+    snprintf(buf, sizeof(buf), "THETA: %.3f RAD", (double)ot);
     LCD_Print(10, 130, buf, LCD_WHITE, LCD_BLACK);
 
     osDelay(200);  // ~5Hz refresh
   }
 
-  /* USER CODE END StartDisplayTask */
+/* USER CODE END StartDisplayTask */
 }
 
 /* USER CODE BEGIN Header_StartServoTask */

@@ -3,6 +3,13 @@
 #include <string.h>
 #include <stdio.h>
 
+/* ---- Debug instrumentation (add to Keil watch window) ---- */
+volatile uint32_t g_lcd_init_done  = 0;  /* 1 when LCD_Init() returns */
+volatile uint32_t g_lcd_clear_done = 0;  /* 1 when first LCD_Clear() returns */
+volatile uint32_t g_lcd_spi_calls  = 0;  /* total LCD_WriteByte() calls */
+volatile uint32_t g_lcd_spi_err    = 0;  /* count of HAL_SPI_Transmit != HAL_OK */
+volatile uint32_t g_lcd_last_st    = 0;  /* last HAL status: 0=OK 1=ERR 2=BUSY 3=TIMEOUT */
+
 /* ---- GPIO pin map ---- */
 #define LCD_CS_PORT    GPIOD
 #define LCD_CS_PIN     GPIO_PIN_9
@@ -20,7 +27,12 @@
 
 static void LCD_WriteByte(uint8_t b)
 {
-    HAL_SPI_Transmit(&hspi2, &b, 1, 10);
+    g_lcd_spi_calls++;
+    HAL_StatusTypeDef st = HAL_SPI_Transmit(&hspi2, &b, 1, 10);
+    if (st != HAL_OK) {
+        g_lcd_spi_err++;
+        g_lcd_last_st = (uint32_t)st;
+    }
 }
 
 static void LCD_WriteCmd(uint8_t cmd)
@@ -62,32 +74,49 @@ void LCD_Init(void)
 
     LCD_CS_LOW();
 
-    LCD_WriteCmdData(0xF7, 0xA9);
-    LCD_WriteCmdData(0xF7, 0x51);
-    LCD_WriteCmdData(0xF7, 0x2C);
-    LCD_WriteCmdData(0xF7, 0x82);
-
-    LCD_WriteCmdData(0xC0, 0x11);
-    LCD_WriteCmdData(0xC0, 0x09);
-    LCD_WriteCmdData(0xC1, 0x41);
-    LCD_WriteCmdData(0xC5, 0x00);
-    LCD_WriteCmdData(0xC5, 0x0A);
-    LCD_WriteCmdData(0xC5, 0x80);
-    LCD_WriteCmdData(0xB1, 0xB0);
-    LCD_WriteCmdData(0xB1, 0x11);
-    LCD_WriteCmdData(0xB4, 0x02);
-    LCD_WriteCmdData(0xB6, 0x02);
-    LCD_WriteCmdData(0xB6, 0x22);
-    LCD_WriteCmdData(0xB7, 0xC6);
-    LCD_WriteCmdData(0xBE, 0x00);
-    LCD_WriteCmdData(0xBE, 0x04);
-    LCD_WriteCmdData(0xE9, 0x00);
-
-    // MADCTL: MY=0 MX=0 MV=0 ML=0 BGR=0 MH=0 (portrait, top-left origin)
-    LCD_WriteCmdData(0x36, 0x08);
-
     // COLMOD: 18-bit/pixel (matches Arduino's 3-byte color writes)
-    LCD_WriteCmdData(0x3A, 0x66);
+    // NOTE: official LCDWIKI demo sends 0x3A FIRST, before the register table.
+    LCD_WriteCmd(0x3A);
+    LCD_WriteData(0x66);
+
+    // IMPORTANT: ILI9488 multi-parameter commands must send the command byte
+    // ONCE (DC low) followed by ALL parameter bytes (DC high). Re-sending the
+    // command resets the parameter index to 0, so the old LCD_WriteCmdData()
+    // per-byte pattern only wrote param[0] of each register (VCOM 0xC5 was
+    // corrupted -> all-white screen). Pattern below matches the official demo.
+    LCD_WriteCmd(0xF7);                 // Adjust control 3
+    LCD_WriteData(0xA9); LCD_WriteData(0x51); LCD_WriteData(0x2C); LCD_WriteData(0x82);
+
+    LCD_WriteCmd(0xC0);                 // Power control 1
+    LCD_WriteData(0x11); LCD_WriteData(0x09);
+
+    LCD_WriteCmd(0xC1);                 // Power control 2
+    LCD_WriteData(0x41);
+
+    LCD_WriteCmd(0xC5);                 // VCOM control (critical for display)
+    LCD_WriteData(0x00); LCD_WriteData(0x0A); LCD_WriteData(0x80);
+
+    LCD_WriteCmd(0xB1);                 // Frame rate control
+    LCD_WriteData(0xB0); LCD_WriteData(0x11);
+
+    LCD_WriteCmd(0xB4);                 // Display inversion
+    LCD_WriteData(0x02);
+
+    LCD_WriteCmd(0xB6);                 // Display function control
+    LCD_WriteData(0x02); LCD_WriteData(0x22);
+
+    LCD_WriteCmd(0xB7);                 // Entry mode set
+    LCD_WriteData(0xC6);
+
+    LCD_WriteCmd(0xBE);                 // Adjust control 2
+    LCD_WriteData(0x00); LCD_WriteData(0x04);
+
+    LCD_WriteCmd(0xE9);                 // Set image function
+    LCD_WriteData(0x00);
+
+    // MADCTL: MY=0 MX=0 MV=0 ML=0 BGR=1 MH=0 (portrait, top-left origin)
+    LCD_WriteCmd(0x36);
+    LCD_WriteData(0x08);
 
     // Positive gamma (0xE0)
     LCD_WriteCmd(0xE0);
@@ -113,6 +142,8 @@ void LCD_Init(void)
 
     // Backlight on
     HAL_GPIO_WritePin(LCD_LED_PORT, LCD_LED_PIN, GPIO_PIN_SET);
+
+    g_lcd_init_done = 1;
 }
 
 /* ---- Set drawing window ---- */
@@ -151,6 +182,8 @@ void LCD_Clear(uint16_t color)
         LCD_WriteByte(color << 3);
     }
     LCD_CS_HIGH();
+
+    g_lcd_clear_done = 1;
 }
 
 /* ---- Fill rectangle ---- */
