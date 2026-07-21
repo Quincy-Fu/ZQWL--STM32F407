@@ -171,10 +171,8 @@ void CAN1_RX0_IRQHandler(void)
   /* USER CODE BEGIN CAN1_RX0_IRQn 0 */
 
   uint8_t i = 0;
-  // 接收�??帧数�??
   if(HAL_CAN_GetRxMessage(&hcan1, CAN_RX_FIFO0, (CAN_RxHeaderTypeDef *)(&can.CAN_RxMsg), (uint8_t *)(&can.rxData)) == HAL_OK)
   {
-    // �??帧数据接收完成，置位帧标志位
     for(i=can.CAN_RxMsg.DLC; i < 8; i++) { can.rxData[i] = 0; } can.rxFrameFlag = true;
   }
 

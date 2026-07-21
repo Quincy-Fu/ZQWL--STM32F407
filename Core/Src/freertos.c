@@ -103,6 +103,8 @@ osThreadId OdomTaskHandle;
 osThreadId OptFlowTaskHandle;
 osThreadId ImuTaskHandle;
 osThreadId DisplayTaskHandle;
+osThreadId ServoTaskHandle;
+osThreadId LightTaskHandle;
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
@@ -119,6 +121,8 @@ void StartOdomTask(void const * argument);
 void StartOptFlowTask(void const * argument);
 void StartImuTask(void const * argument);
 void StartDisplayTask(void const * argument);
+void StartServoTask(void const * argument);
+void StartLightTask(void const * argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -189,6 +193,14 @@ void MX_FREERTOS_Init(void) {
   osThreadDef(DisplayTask, StartDisplayTask, osPriorityBelowNormal, 0, 512);
   DisplayTaskHandle = osThreadCreate(osThread(DisplayTask), NULL);
 
+  /* definition and creation of ServoTask */
+  osThreadDef(ServoTask, StartServoTask, osPriorityNormal, 0, 512);
+  ServoTaskHandle = osThreadCreate(osThread(ServoTask), NULL);
+
+  /* definition and creation of LightTask */
+  osThreadDef(LightTask, StartLightTask, osPriorityLow, 0, 512);
+  LightTaskHandle = osThreadCreate(osThread(LightTask), NULL);
+
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
@@ -204,7 +216,7 @@ void MX_FREERTOS_Init(void) {
 /* USER CODE END Header_StartDefaultTask */
 void StartDefaultTask(void const * argument)
 {
-    /* USER CODE BEGIN StartDefaultTask */
+  /* USER CODE BEGIN StartDefaultTask */
   /* Infinite loop */
   for(;;)
   {
@@ -256,7 +268,7 @@ void StartTask02(void const * argument)
     osDelay(50);  // ~100ms cycle
   }
 
-/* USER CODE END StartTask02 */
+  /* USER CODE END StartTask02 */
 }
 
 /* USER CODE BEGIN Header_StartOdomTask */
@@ -349,7 +361,7 @@ void StartOdomTask(void const * argument)
     osDelay(10);  // ~15ms per motor read, 4 motors ~60ms per odom cycle
   }
 
-/* USER CODE END StartOdomTask */
+  /* USER CODE END StartOdomTask */
 }
 
 /* USER CODE BEGIN Header_StartOptFlowTask */
@@ -366,7 +378,7 @@ void StartOptFlowTask(void const * argument)
   // PMW3901 optical flow not in use; suspend immediately
   vTaskSuspend(NULL);
 
-/* USER CODE END StartOptFlowTask */
+  /* USER CODE END StartOptFlowTask */
 }
 
 /* USER CODE BEGIN Header_StartImuTask */
@@ -406,7 +418,7 @@ void StartImuTask(void const * argument)
     osDelay(10);  // 100Hz parse (IMU reports at 25Hz)
   }
 
-/* USER CODE END StartImuTask */
+  /* USER CODE END StartImuTask */
 }
 
 /* USER CODE BEGIN Header_StartDisplayTask */
@@ -459,7 +471,43 @@ void StartDisplayTask(void const * argument)
     osDelay(200);  // ~5Hz refresh
   }
 
-/* USER CODE END StartDisplayTask */
+  /* USER CODE END StartDisplayTask */
+}
+
+/* USER CODE BEGIN Header_StartServoTask */
+/**
+* @brief Function implementing the ServoTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartServoTask */
+void StartServoTask(void const * argument)
+{
+  /* USER CODE BEGIN StartServoTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartServoTask */
+}
+
+/* USER CODE BEGIN Header_StartLightTask */
+/**
+* @brief Function implementing the LightTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartLightTask */
+void StartLightTask(void const * argument)
+{
+  /* USER CODE BEGIN StartLightTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartLightTask */
 }
 
 /* Private application code --------------------------------------------------*/
