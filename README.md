@@ -13,13 +13,13 @@ STM32F407ZGT6 + FreeRTOS + CubeMX，麦轮底盘下位机。
 | 外设 | 引脚 | 速率 | 用途 |
 |------|------|------|------|
 | CAN1 | PB8=RX, PB9=TX | 500kbps | 4× Emm_V5.0 闭环步进电机 |
-| SPI1 | PA5=SCK, PA6=MISO, PA7=MOSI | 2.625Mbps Mode 3 | PMW3901 光流传感器 |
+| SPI1 | PA5=SCK, PA6=MISO, PA7=MOSI | 2.625Mbps Mode 3 | PMW3901 光流传感器（当前挂起未用） |
 | SPI2 | PB13=SCK, PB14=MISO, PB15=MOSI | 5.25Mbps Mode 0 | ILI9488 3.5" LCD (320×480) |
 | USART1 | PA9=TX, PA10=RX | 115200 8N1 | 9 轴 IMU (0x7E 0x23 协议) |
 | USART6 | PC6=TX, PC7=RX | 115200 8N1 | 预留 |
 | SWD | PA13=SWDIO, PA14=SWCLK | — | 调试 |
 
-GPIO: PD9=LCD_CS, PD10=LCD_RST, PD11=LCD_DC, PD12=LCD_LED, PE4=PMW3901_CS.
+GPIO: PD9=LCD_CS, PD10=LCD_RST, PD11=LCD_DC, PD12=LCD_LED（开机置高点亮背光）, PE4=PMW3901_CS。
 
 ## 源文件
 
@@ -28,9 +28,9 @@ GPIO: PD9=LCD_CS, PD10=LCD_RST, PD11=LCD_DC, PD12=LCD_LED, PE4=PMW3901_CS.
 | 文件 | 说明 |
 |------|------|
 | `Emm_V5.h` | 电机 CAN 协议库。地址宏 (0x01~0x04)、`SysParams_t` 参数索引枚举、13 个控制 API 声明 |
-| `pmw3901.h` | 光流驱动。安装参数 (高度/分辨率)、寄存器地址、`pmw3901_init()` / `pmw3901_read_motion()` |
-| `imu_protocol.h` | IMU 帧协议。帧头 `0x7E 0x23`、功能码 (欧拉角=0x26)、环形缓冲 API |
-| `imu_uart.h` | IMU 串口接收。`imu_uart_start_rx()` 启动单字节 DMA 接收循环 |
+| `pmw3901.h` | 光流驱动。安装参数、寄存器地址、`pmw3901_init()` / `pmw3901_read_motion()`（任务当前挂起） |
+| `imu_protocol.h` | IMU 帧协议。帧头 `0x7E 0x23`、功能码 (欧拉角=0x26, 6轴切换=0x61, 校准=0x70)、环形缓冲 API、调试变量 |
+| `imu_uart.h` | IMU 串口收发。`imu_uart_start_rx()` 启动接收、`imu_uart_set_6axis()` / `imu_uart_calibrate_imu()` 发命令 |
 | `lcd_ili9488.h` | LCD 驱动。320×480、RGB565 颜色宏、`LCD_Init()` / `LCD_Clear()` / `LCD_Print()` |
 | `can.h` | CAN1 外设。`CAN_t` 结构体 (含 rxData/rxFrameFlag)、`can_SendCmd()` |
 | `spi.h` | SPI1/SPI2 句柄 (`hspi1`, `hspi2`) 和 `MX_SPIx_Init()` |
@@ -44,13 +44,13 @@ GPIO: PD9=LCD_CS, PD10=LCD_RST, PD11=LCD_DC, PD12=LCD_LED, PE4=PMW3901_CS.
 | 文件 | 说明 |
 |------|------|
 | `main.c` | 入口。`HAL_Init` → 时钟 168MHz → 各外设 Init → CAN 启动 → IMU 串口启动 → `MX_FREERTOS_Init` → `osKernelStart` |
-| `freertos.c` | **所有业务逻辑**。6 个任务、全局变量 (里程计/IMU/光流/目标速度)、`motor_emit()`、几何参数宏 |
+| `freertos.c` | **所有业务逻辑**。8 个任务、全局变量 (里程计/IMU/目标速度)、`motor_emit()`、几何参数宏 |
 | `Emm_V5.c` | 电机协议实现。13 个函数均通过 `can_SendCmd()` 发 CAN 帧：速度控制 (`0xF6`)、位置控制 (`0xFD`)、使能 (`0xF3`)、停止 (`0xFE`)、同步等 |
 | `can.c` | CAN1 500kbps 初始化 + `can_SendCmd` (支持 >8 字节分包，ExtId=[addr<<8\|packNum]) + `CAN1_RX0_IRQHandler` |
-| `pmw3901.c` | 光流驱动实现。SPI1 Mode 3 读写寄存器、上电初始化 (验证 Product ID → POR 寄存器优化 → 验证 Observation)、Motion Burst 12 字节读 |
-| `imu_protocol.c` | IMU 协议解析。256B 环形缓冲 + 5 状态机解析帧、累加和校验、`IMU_FUNC_EULER` → 小端 float yaw × 57.2958 转度 |
-| `imu_uart.c` | USART1 单字节 `HAL_UART_Receive_IT` + 回调自动续接，每字节推入协议环形缓冲 |
-| `lcd_ili9488.c` | LCD 驱动实现。SPI2 写命令/数据、ILI9488 初始化序列 (Arduino 例程)、8×16 ASCII 字体 (43 字符)、`LCD_Print` 字符渲染 |
+| `pmw3901.c` | 光流驱动实现。SPI1 Mode 3 读写寄存器、上电初始化、Motion Burst 12 字节读（任务当前挂起） |
+| `imu_protocol.c` | IMU 协议解析。256B 环形缓冲 + 5 状态机解析帧、累加和校验、`IMU_FUNC_EULER` → 小端 float yaw × 57.2958 转度、**首帧 yaw 记为 0° 基准（软件零点）** |
+| `imu_uart.c` | USART1 单字节 `HAL_UART_Receive_IT` + 回调自动续接，每字节推入协议环形缓冲；命令发送组帧 (`0x7E 0x23` 头 + 累加和) |
+| `lcd_ili9488.c` | LCD 驱动实现。SPI2 写命令/数据、ILI9488 初始化序列、8×16 ASCII 字体 (43 字符)、`LCD_Print` 字符渲染、LCD 调试变量 |
 | `spi.c` | SPI1/SPI2 初始化 + `HAL_SPI_MspInit` (引脚 AF 配置) |
 | `usart.c` | USART1/USART6 115200 8N1 初始化 |
 | `gpio.c` | 所有 GPIO 初始化 (LCD 控制脚 + 触摸预留 + SPI CS) |
@@ -60,29 +60,39 @@ GPIO: PD9=LCD_CS, PD10=LCD_RST, PD11=LCD_DC, PD12=LCD_LED, PE4=PMW3901_CS.
 
 ## FreeRTOS 任务
 
-| 任务 | 入口 | 优先级 | 栈 | 周期 | 功能 |
+| 任务 | 入口 | 优先级 | 栈 | 周期 | 状态 / 功能 |
 |------|------|--------|-----|------|------|
-| MotorTask | `StartTask02` | High | 512W | ~100ms | 电机使能、光流初始化、逆运动学计算 RPM、CAN 发速度命令 |
+| MotorTask | `StartTask02` | High | 512W | ~100ms | **当前停用**（空循环）。原功能：电机使能、逆运动学算 RPM、CAN 发速度命令 |
 | OdomTask | `StartOdomTask` | Normal | 512W | ~60ms | 轮询 4 电机 S_CPOS 位置 → 正运动学 → 世界系累加 `g_odom_x/y/theta` |
-| OptFlowTask | `StartOptFlowTask` | Normal | 512W | 10ms | 光流 Motion Burst → 转弯检测 (yaw 变化 > 1.1° 丢弃) → 累加 `g_optflow_x/y` |
-| ImuTask | `StartImuTask` | Normal | 512W | 10ms | 解析 IMU 帧 → 更新 `g_imu_yaw` (度) |
-| DisplayTask | `StartDisplayTask` | BelowNormal | 512W | 200ms | LCD 刷新调试数据: 里程计 XYZ / IMU yaw / 光流 XY + Squal |
+| OptFlowTask | `StartOptFlowTask` | Normal | 512W | — | **挂起**（`vTaskSuspend(NULL)`，PMW3901 当前未用） |
+| ImuTask | `StartImuTask` | Normal | 512W | 10ms | 发 6 轴切换命令 → 解析 IMU 帧 → 更新 `g_imu_yaw` (度) → 帧计数达标置 `g_imu_verified` |
+| DisplayTask | `StartDisplayTask` | BelowNormal | 512W | 200ms | LCD 刷新: IMU 状态/帧计数、YAW、里程计 X/Y/THETA |
+| ServoTask | `StartServoTask` | Normal | 512W | — | 空占位，舵机逻辑待填 |
+| LightTask | `StartLightTask` | Low | 512W | — | 空占位，灯光逻辑待填 |
 | defaultTask | `StartDefaultTask` | Normal | 128W | 空闲 | 空循环，预留给 Monitor/心跳 |
 
 ## 里程计融合
 
-三个传感器分工，不分主次：
+当前用编码器 + IMU 两个传感器（光流挂起未用）：
 
 | 传感器 | 提供 | 强项 | 弱项 |
 |--------|------|------|------|
-| 电机编码器 (Emm_V5.0) | x, y | 直线位移准 | θ 推算受轴距误差影响；打滑失效 |
-| IMU (USART1) | θ | 不受打滑/轴距误差影响 | 长期零漂 (比赛几分钟可控) |
-| 光流 (PMW3901) | x, y 辅助 | 不受打滑影响 | 偏心安装，转弯引入假位移 |
+| 电机编码器 (Emm_V5.0) | x, y | 直线位移准 | 打滑失效 |
+| IMU (USART1) | θ | 不受打滑/轴距误差影响 | 长期零漂（6 轴模式已抑制） |
+| 光流 (PMW3901) | — | — | 当前挂起未用 |
 
 策略：
-- **θ** → 直接读 IMU yaw 覆盖 `g_odom_theta`，不用编码器推 θ
-- **x, y** → 编码器正运动学，用 IMU θ 旋转到世界系
-- **光流** → 只在直线段累加 (`|d_yaw| < 1.1°`)，转弯段丢帧
+- **θ** → 直接读 IMU yaw（度→弧度）覆盖 `g_odom_theta`，不用编码器推 θ
+- **x, y** → 编码器正运动学算出体系位移，用 IMU θ 旋转到世界系累加
+
+正运动学（麦轮，右侧镜像安装取反）：
+
+```
+dx_body = ( d_FL + d_FR + d_RL - d_RR') × 0.25    # d_FR'、d_RR' 已取反
+dy_body = (-d_FL + d_FR' + d_RL - d_RR') × 0.25
+x += dx_body·cosθ - dy_body·sinθ
+y += dx_body·sinθ + dy_body·cosθ
+```
 
 ## 关键常量
 
@@ -92,7 +102,7 @@ GPIO: PD9=LCD_CS, PD10=LCD_RST, PD11=LCD_DC, PD12=LCD_LED, PE4=PMW3901_CS.
 WHEEL_DIAMETER_M       = 0.065f   // 轮径 65mm
 WHEEL_BASE_HALF_X_M    = 0.085f   // 半轴距 85mm (前后)
 WHEEL_BASE_HALF_Y_M    = 0.085f   // 半轮距 85mm
-L_SUM_M = 0.170f                   // 自动算 (半轴距 + 半轮距)
+L_SUM_M = 0.170f                  // 自动算 (半轴距 + 半轮距)
 RPM_PER_MPS = 60/(2π × 0.0325)    // m/s → RPM 换算
 ```
 
@@ -101,22 +111,18 @@ RPM_PER_MPS = 60/(2π × 0.0325)    // m/s → RPM 换算
 - CAN 地址: FL=0x01, FR=0x02, RL=0x03, RR=0x04
 - 协议: ExtId=[addr<<8 | packNum], Data=[func, payload..., 0x6B checksum]
 - 速度上限: `MOTOR_VEL_LIMIT = 5000` RPM
-- 命令间隔: ≥ 10ms (防止丢帧)
 - 右侧镜像安装: `motor_emit` 内部通过 `is_right` 标志自动反转方向
 - 编码器: 1 unit = 1/65536 圈, `ENC_TO_M = π×D/65536` m/unit
-
-### 光流 (PMW3901)
-
-- 安装高度: 0.10m (占位，待装好后量实物校准)
-- 像素→米: `PMW_PIX_TO_M = 0.002131946f`
-- 有效数据: Observation = 0xBF, SQUAL ≥ 0x19
 
 ### IMU
 
 - 协议: 帧头 `0x7E 0x23`, 欧拉角功能码 `0x26`, 累加和校验
-- yaw 单位: 度 (内部 `× 57.29578` rad→deg)
+- 6 轴切换: 功能码 `0x61`, 参数 `{0x06, 0x5F}`（开机发送，抑制磁漂；不确定是否存 flash 故每次重发）
+- 校准: 功能码 `0x70`, 参数 `{0x01, 0x5F}`（**开机不发**，函数 `imu_uart_calibrate_imu()` 保留供手动调用，需静止约 7s）
+- yaw 单位: IMU 上报弧度，内部 `× 57.29578` 转度
+- yaw 零点: **软件零点**——开机后第一个有效帧的 yaw 记为 0° 基准，之后显示值 = 原始值 − 基准
 - 上报频率: 25Hz
-- 上电自动归零
+- 校验: 连续收到 ≥ `IMU_VERIFY_FRAMES`(10) 个合法帧 → `g_imu_verified = 1`
 
 ## 全局变量（任务间共享）
 
@@ -124,14 +130,14 @@ RPM_PER_MPS = 60/(2π × 0.0325)    // m/s → RPM 换算
 
 | 变量 | 类型 | 单位 | 生产者 | 消费者 |
 |------|------|------|--------|--------|
-| `g_tgt_vx / vy / omega` | int16 | m/s×100 / rad/s×100 | MotorTask (测试) / CommTask (未来) | MotorTask |
-| `g_odom_x / y` | float | m | OdomTask | MotorTask, DisplayTask |
-| `g_odom_theta` | float | rad | OdomTask (读 IMU) | MotorTask, DisplayTask |
-| `g_imu_yaw` | float | deg | ImuTask | OdomTask, OptFlowTask, DisplayTask |
-| `g_optflow_x / y` | float | m | OptFlowTask | DisplayTask |
-| `g_optflow_obs / squal` | uint8 | — | OptFlowTask | DisplayTask |
-| `g_optflow_init_ok` | bool | — | MotorTask (写) | OptFlowTask (读) |
+| `g_tgt_vx / vy / omega` | int16 | m/s×100 / rad/s×100 | CommTask (未来) / 调试器 | MotorTask |
+| `g_odom_x / y` | float | m | OdomTask | DisplayTask |
+| `g_odom_theta` | float | rad | OdomTask (读 IMU) | DisplayTask |
+| `g_imu_yaw` | float | deg | ImuTask | OdomTask, DisplayTask |
+| `g_imu_verified` | uint8 | — | ImuTask | DisplayTask |
 | `can` | CAN_t | — | CAN1_RX0_IRQHandler | OdomTask |
+
+IMU 调试变量（[imu_protocol.c](Core/Src/imu_protocol.c)，Keil 在线看）：`imu_frame_count`（合法帧计数）、`imu_rx_byte_count`（收到总字节数）、`imu_last_func`、`imu_last_checksum_ok`、`imu_raw_yaw`（原始弧度）。
 
 ## Emm_V5.0 CAN 协议要点
 
@@ -142,17 +148,49 @@ RPM_PER_MPS = 60/(2π × 0.0325)    // m/s → RPM 换算
 
 ## ILI9488 LCD
 
-- 接口: SPI2 Mode 0, 5.25MHz, 控制脚 PD9~PD12
-- 色彩: 18-bit/pixel (3 字节 RGB666，与 Arduino 例程一致)
-- 字体: 内嵌 8×16 ASCII (大写 A-Z + 数字 0-9 + 部分符号, 43 字符)
-- 用途: 调试信息显示 (DisplayTask 5Hz 刷新)
+- 接口: SPI2 Mode 0, 5.25MHz, 控制脚 PD9~PD12（CS/RST/DC/LED）
+- 色彩: 18-bit/pixel (3 字节 RGB666，COLMOD `0x3A=0x66`)
+- **初始化序列关键规则**: 多参数命令的命令字节只发一次（DC 低），参数连续发（DC 高）。ILI9488 重发命令字节会使参数索引归零——逐字节重发命令会只写入最后一个参数（VCOM `0xC5` 被写坏 → 白屏）。序列与官方 LCDWIKI 例程逐字节一致，`0x3A` 提前发送。
+- 方向: MADCTL `0x36=0x08`（竖屏 320×480, BGR）。旋转方法见下方「LCD 旋转」小节。
+- 字体: 内嵌 8×16 ASCII (大写 A-Z + 数字 0-9 + 部分符号, 43 字符)，**仅大写**
+- 调试变量 ([lcd_ili9488.c](Core/Src/lcd_ili9488.c)): `g_lcd_init_done` / `g_lcd_clear_done` / `g_lcd_spi_calls` / `g_lcd_spi_err` / `g_lcd_last_st`
+
+### LCD 旋转（MADCTL 0x36）
+
+旋转/镜像由 MADCTL 寄存器（命令 `0x36`）的位组合控制，整屏（含文字）一起转，文字始终可读：
+
+| 位 | 值 | 含义 |
+|----|-----|------|
+| MY | 0x80 | 页地址顺序（上下翻转） |
+| MX | 0x40 | 列地址顺序（左右翻转） |
+| MV | 0x20 | 页/列互换（横竖屏切换的关键位） |
+| ML | 0x10 | 垂直刷新顺序 |
+| BGR | 0x08 | 色彩顺序（本屏必须置 1） |
+| MH | 0x04 | 水平刷新顺序 |
+
+官方 LCDWIKI 例程的 ILI9488 旋转值（源自 `LCDWIKI_SPI.cpp` 的 `Set_Rotation`，case ID_9488）：
+
+| 方向 | MADCTL | 位组合 |
+|------|--------|--------|
+| 0°（竖屏 320×480） | 0xC8 | MY\|MX\|BGR |
+| 90°（横屏 480×320） | 0xA8 | MY\|MV\|BGR |
+| 180°（竖屏倒置） | 0x18 | ML\|BGR |
+| 270°（横屏反向） | 0x78 | MX\|ML\|MV\|BGR |
+
+**重要：上表不能直接照搬。** 本模块实测可用的竖屏值是 `0x08`（仅 BGR），与官方例程的 0°（0xC8）差了 MX|MY——说明这块屏的贴合方向和官方参考不一致，旋转值必须以 `0x08` 为基准在本机上实测确定：
+
+- 横屏：在 `0x08` 基础上置 MV 位 → 先试 `0x28`；若画面镜像，再按需翻转 MX(0x40)/MY(0x80) 凑出正确方向。
+- 改 MADCTL 后**必须同步对调** [lcd_ili9488.h](Core/Inc/lcd_ili9488.h) 的 `LCD_WIDTH`/`LCD_HEIGHT`（横屏为 480×320），否则 `LCD_Clear`/`LCD_SetWindow` 坐标范围错误。
+- 代码位置：[lcd_ili9488.c](Core/Src/lcd_ili9488.c) `LCD_Init()` 中 `LCD_WriteCmd(0x36)` 后的 `LCD_WriteData(0x08)`。
+- 字体逐像素走坐标绘制，旋转后自动跟随，无需改动。
 
 ## 未完成
 
+- MotorTask 重新启用（当前为空循环停用）
 - CommTask: 上位机通讯 (USART6 预留)
 - 位置环 / 路径跟随
-- 光流安装高度校准 (目前 0.10m 占位)
-- IMU yaw 单位实测确认 (目前假设例程正确: 弧度×57.3→度)
+- 光流 (PMW3901) 重新启用与安装高度校准（当前挂起）
+- ServoTask / LightTask 业务逻辑
 - 触摸屏驱动 (XPT2046, 引脚已预留 PC9~PC12/PG8, 未写驱动)
 
 ## 约束

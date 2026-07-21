@@ -22,6 +22,11 @@ enum {
 /* 内部缓存: 只存 yaw (用户当前只需要这个) */
 static volatile float s_yaw = 0.0f;
 
+/* Yaw zero reference: capture the first valid yaw as the 0-deg reference so
+ * the heading reads exactly 0 deg at power-on (user requirement). */
+static volatile uint8_t s_yaw_zeroed = 0;
+static volatile float   s_yaw_offset = 0.0f;
+
 /* 调试变量 */
 volatile uint8_t  imu_last_func         = 0;
 volatile uint32_t imu_frame_count       = 0;
@@ -68,8 +73,12 @@ static void parse_frame(uint8_t func, const uint8_t *data, uint8_t data_len)
              * IMU 上报弧度, 转成角度存 (g_imu_yaw 单位度, 更直观) */
             if (data_len >= 12) {
                 float raw = to_float(&data[8]);
-                imu_raw_yaw = raw;  /* debug: check if ~1.57 for 90deg (radians) or ~90 (degrees) */
-                s_yaw = raw * 57.2957795f;
+                imu_raw_yaw = raw;  /* debug: raw yaw in radians */
+                if (!s_yaw_zeroed) {
+                    s_yaw_offset = raw;   /* first valid frame defines 0 deg */
+                    s_yaw_zeroed = 1;
+                }
+                s_yaw = (raw - s_yaw_offset) * 57.2957795f;
             }
             break;
         /* 其他功能码暂不解析 (用户只要 yaw, YAGNI) */

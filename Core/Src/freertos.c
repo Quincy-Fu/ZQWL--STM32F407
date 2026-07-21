@@ -369,8 +369,18 @@ void StartImuTask(void const * argument)
   // Wait for other tasks to initialize
   osDelay(2500);
 
-  // Start USART1 reception (HAL_UART_Receive_IT, 1-byte + callback auto-restart)
+  // Start USART1 reception FIRST (so the IMU's response frames are captured)
   imu_uart_start_rx();
+
+  // Switch IMU to 6-axis algorithm (no magnetometer) -- stops drift.
+  // Re-sent every boot: it's only one frame (cheap), and we haven't confirmed
+  // the setting persists in flash, so re-sending is the safe choice.
+  imu_uart_set_6axis();
+  osDelay(100);  // wait for internal mode switch
+
+  // Per-boot 7s gyro/accel calibration REMOVED (wasted ~7s; the IMU keeps its
+  // calibration in flash). imu_uart_calibrate_imu() still exists in imu_uart.c
+  // for a manual re-calibration if ever needed.
 
   float yaw;
   for(;;) {
