@@ -63,6 +63,16 @@
 #define IMU_VERIFY_FRAMES      10     // min valid frames to confirm IMU OK
 #define IMU_VERIFY_TIMEOUT     10000  // timeout (ms)
 
+// ===== 5th motor: 5-slot position actuator (like a servo, CAN addr 0x05) =====
+// 16 microstep -> 3200 pulses/rev (vendor example), 5 slots x 72 deg = 360 deg
+#define POS_MOTOR_ADDR         0x05   // CAN address of the 5th motor
+#define POS_PULSES_PER_REV     3200u  // 16 microstep: 3200 pulses = 1 rev
+#define POS_SLOT_COUNT         5      // number of slots
+#define POS_PULSES_PER_SLOT    (POS_PULSES_PER_REV / POS_SLOT_COUNT)  // 640 = 72 deg
+#define POS_MOVE_VEL_RPM       1000   // slot-to-slot move speed (RPM)
+#define POS_MOVE_ACC           10     // acceleration gear (0 = direct start)
+#define POS_HOME_WAIT_MS       2500   // wait for power-on homing to complete
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -96,6 +106,11 @@ volatile float g_imu_yaw = 0.0f;
 // IMU status: 1 = verified OK
 volatile uint8_t g_imu_verified = 0;
 
+// ===== 5th motor slot command =====
+// Set by CommTask (future) or Keil debugger.
+// Valid: 0..4 = target slot index (each slot = 72 deg, slot 0 = homing origin)
+volatile uint8_t g_target_gear = 0;
+
 /* USER CODE END Variables */
 osThreadId defaultTaskHandle;
 osThreadId MotorTaskHandle;
@@ -105,6 +120,7 @@ osThreadId ImuTaskHandle;
 osThreadId DisplayTaskHandle;
 osThreadId ServoTaskHandle;
 osThreadId LightTaskHandle;
+osThreadId PosMotorTaskHandle;
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
@@ -123,6 +139,7 @@ void StartImuTask(void const * argument);
 void StartDisplayTask(void const * argument);
 void StartServoTask(void const * argument);
 void StartLightTask(void const * argument);
+void StartPosMotorTask(void const * argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -201,6 +218,10 @@ void MX_FREERTOS_Init(void) {
   osThreadDef(LightTask, StartLightTask, osPriorityLow, 0, 512);
   LightTaskHandle = osThreadCreate(osThread(LightTask), NULL);
 
+  /* definition and creation of PosMotorTask */
+  osThreadDef(PosMotorTask, StartPosMotorTask, osPriorityNormal, 0, 512);
+  PosMotorTaskHandle = osThreadCreate(osThread(PosMotorTask), NULL);
+
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
@@ -242,7 +263,7 @@ void StartTask02(void const * argument)
     osDelay(100);
   }
 
-/* USER CODE END StartTask02 */
+  /* USER CODE END StartTask02 */
 }
 
 /* USER CODE BEGIN Header_StartOdomTask */
@@ -455,7 +476,7 @@ void StartDisplayTask(void const * argument)
     osDelay(200);  // ~5Hz refresh
   }
 
-/* USER CODE END StartDisplayTask */
+  /* USER CODE END StartDisplayTask */
 }
 
 /* USER CODE BEGIN Header_StartServoTask */
@@ -492,6 +513,57 @@ void StartLightTask(void const * argument)
     osDelay(1);
   }
   /* USER CODE END StartLightTask */
+}
+
+/* USER CODE BEGIN Header_StartPosMotorTask */
+/**
+* @brief Function implementing the PosMotorTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartPosMotorTask */
+void StartPosMotorTask(void const * argument)
+{
+  /* USER CODE BEGIN StartPosMotorTask */
+
+  // Wait for the Emm_V5.0 driver to boot (vendor example ~2s, OdomTask uses 2.5s)
+  osDelay(2500);
+
+  // Trigger single-turn nearest homing: motor returns to the saved origin (= slot 0).
+  // The origin must have been set+saved ONCE at install time: align the mechanism
+  // to slot 0, then via vendor host PC -> O_Set -> Set O (save). See manual 7.1.
+  // The driver's position counter resets on power-off, so this homing re-establishes
+  // the absolute reference at every power-on. Homing move is <=180 deg at 30 RPM
+  // -> completes in <=~1s; we wait longer as a safe margin.
+  Emm_V5_Origin_Trigger_Return(POS_MOTOR_ADDR, 0 /*nearest*/, 0 /*no sync*/);
+
+  // Wait for homing to finish. This task is SEND-ONLY (never reads CAN responses)
+  // to avoid contending with OdomTask over the single shared RX buffer (can.rxData).
+  osDelay(POS_HOME_WAIT_MS);
+
+  uint8_t cur_gear = 0;  // after homing the mechanism is at slot 0
+
+  for(;;) {
+    uint8_t tgt = g_target_gear;
+
+    if (tgt < POS_SLOT_COUNT && tgt != cur_gear) {
+      // Absolute position move to slot tgt (= tgt * 72 deg from origin).
+      // The position command is 13 bytes -> split into 2 CAN packets by can_SendCmd;
+      // wrap in a critical section so OdomTask's S_CPOS frames cannot interleave
+      // between the two packets. (OdomTask's own sends are single-frame/atomic.)
+      taskENTER_CRITICAL();
+      Emm_V5_Pos_Control(POS_MOTOR_ADDR, 0 /*CW*/, POS_MOVE_VEL_RPM, POS_MOVE_ACC,
+                         (uint32_t)tgt * POS_PULSES_PER_SLOT,
+                         true  /*absolute*/,
+                         false /*no sync*/);
+      taskEXIT_CRITICAL();
+      cur_gear = tgt;
+    }
+
+    osDelay(20);
+  }
+
+  /* USER CODE END StartPosMotorTask */
 }
 
 /* Private application code --------------------------------------------------*/
