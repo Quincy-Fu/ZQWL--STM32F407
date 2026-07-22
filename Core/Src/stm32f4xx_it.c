@@ -67,6 +67,19 @@ volatile uint32_t g_rx_rotate_count  = 0;
 volatile uint32_t g_rx_arm_count     = 0;
 volatile uint32_t g_rx_light_count   = 0;
 
+// LIGHT command pending flag (consumed by LightTask)
+volatile uint8_t g_light_pending_id = 0;   // 0=all, 1-3=specific light
+volatile uint8_t g_light_pending_on = 0;   // 0=off, 1=on
+volatile uint8_t g_light_pending    = 0;   // 1=new command pending
+
+// ARM servo pending flag (consumed by ServoTask)
+// ARM payload: [servo_id(1B), angle_lo(1B), angle_hi(1B)] = 3 bytes
+//   servo_id: 1 or 2 (TIM2 CH2=PA1 or CH3=PA2)
+//   angle: uint16_t LE, 0-180 degrees
+volatile uint8_t  g_arm_servo_id    = 0;   // 1 or 2
+volatile uint16_t g_arm_servo_angle = 0;   // 0-180 degrees
+volatile uint8_t  g_arm_servo_pending = 0; // 1=new command pending
+
 static inline void dispatch_frame(uint8_t type, const uint8_t *payload, uint8_t len)
 {
     if (type == TYPE_CMD_VEL && len == PAYLOAD_SIZE_VEL) {
@@ -82,8 +95,22 @@ static inline void dispatch_frame(uint8_t type, const uint8_t *payload, uint8_t 
         if (pos < 5) g_target_gear = pos;
         g_rx_rotate_count++;
     } else if (type == TYPE_ARM) {
+        if (len >= 3) {
+            uint8_t sid = payload[0];
+            uint16_t angle = (uint16_t)payload[1] | ((uint16_t)payload[2] << 8);
+            if (sid >= 1 && sid <= 2 && angle <= 180) {
+                g_arm_servo_id = sid;
+                g_arm_servo_angle = angle;
+                g_arm_servo_pending = 1;
+            }
+        }
         g_rx_arm_count++;
     } else if (type == TYPE_LIGHT) {
+        if (len >= 2) {
+            g_light_pending_id = payload[0];  // 0=all, 1-3=specific
+            g_light_pending_on = payload[1];  // 0=off, nonzero=on
+            g_light_pending = 1;
+        }
         g_rx_light_count++;
     }
 }

@@ -31,8 +31,11 @@
 #include "imu_uart.h"
 #include "lcd_ili9488.h"
 #include "uart_protocol.h"
+#include "light.h"
+#include "tim.h"
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -84,12 +87,11 @@
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
 
-// ===== Velocity command input =====
-// Set by CommTask (future) or Keil debugger
-// Unit: vx,vy = m/s x 100, omega = rad/s x 100
-volatile int16_t g_tgt_vx    = 0;
-volatile int16_t g_tgt_vy    = 0;
-volatile int16_t g_tgt_omega = 0;
+// ===== Velocity command input (float, set by CommTask DataQueue or Keil debugger) =====
+// Unit: vx,vy = m/s, omega = rad/s
+volatile float g_tgt_vx    = 0.0f;
+volatile float g_tgt_vy    = 0.0f;
+volatile float g_tgt_omega = 0.0f;
 
 // ===== Odometry output (THE core result) =====
 // Updated by OdomTask, read by CommTask / DisplayTask / Keil debugger
@@ -122,6 +124,18 @@ osThreadId DisplayTaskHandle;
 osThreadId ServoTaskHandle;
 osThreadId LightTaskHandle;
 osThreadId PosMotorTaskHandle;
+osThreadId CommTaskHandle;
+osMessageQId DataQueueHandle;
+
+// Light control: set by ISR dispatch, consumed by LightTask
+extern volatile uint8_t  g_light_pending_id;
+extern volatile uint8_t  g_light_pending_on;
+extern volatile uint8_t  g_light_pending;
+
+// ARM servo control: set by ISR dispatch, consumed by ServoTask
+extern volatile uint8_t  g_arm_servo_id;       // 1 or 2
+extern volatile uint16_t g_arm_servo_angle;    // 0-180 degrees
+extern volatile uint8_t  g_arm_servo_pending;  // 1=new command
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
@@ -141,6 +155,8 @@ void StartDisplayTask(void const * argument);
 void StartServoTask(void const * argument);
 void StartLightTask(void const * argument);
 void StartPosMotorTask(void const * argument);
+void StartCommTask(void const * argument);
+void SendPoseToPC(float x, float y, float theta);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -262,10 +278,52 @@ void StartTask02(void const * argument)
 {
   /* USER CODE BEGIN StartTask02 */
 
-  // Motor test disabled: do not enable drivers, do not send velocity commands
-  // To re-enable: restore Emm_V5_En_Control + velocity loop
+  // Enable 4 motor drivers
+  Emm_V5_En_Control(MOTOR_FL, true, false); osDelay(10);
+  Emm_V5_En_Control(MOTOR_FR, true, false); osDelay(10);
+  Emm_V5_En_Control(MOTOR_RL, true, false); osDelay(10);
+  Emm_V5_En_Control(MOTOR_RR, true, false); osDelay(100);
+
+  // Wait for motor driver initialization
+  osDelay(2000);
+
+  // Velocity control loop
+  // g_tgt_vx/vy/omega: set by DataQueue (upper PC CMD_VEL) or Keil debugger
+  // Unit: vx,vy = m/s, omega = rad/s
   for(;;) {
-    osDelay(100);
+    // Check DataQueue for new velocity commands (non-blocking)
+    osEvent evt = osMessageGet(DataQueueHandle, 0);
+    if (evt.status == osEventMessage) {
+      DataPacket_t *pkt = (DataPacket_t *)evt.value.p;
+      float vx, vy, w;
+      memcpy(&vx, pkt->data,     4);
+      memcpy(&vy, pkt->data + 4, 4);
+      memcpy(&w,  pkt->data + 8, 4);
+      __disable_irq();
+      g_tgt_vx    = vx;
+      g_tgt_vy    = vy;
+      g_tgt_omega = w;
+      __enable_irq();
+    }
+
+    float vx = g_tgt_vx;    // m/s
+    float vy = g_tgt_vy;    // m/s
+    float w  = g_tgt_omega;  // rad/s
+
+    // Inverse kinematics: body velocity -> 4 wheel RPM
+    // vx=forward(+), vy=left(+), w=CCW(+); right-side motors mirror-mounted
+    float rpm_FL = (vx - vy - L_SUM_M * w) * RPM_PER_MPS;
+    float rpm_FR = (vx + vy + L_SUM_M * w) * RPM_PER_MPS;
+    float rpm_RL = (vx + vy - L_SUM_M * w) * RPM_PER_MPS;
+    float rpm_RR = (vx - vy + L_SUM_M * w) * RPM_PER_MPS;
+
+    // Send CAN velocity commands (10ms spacing to prevent frame loss)
+    motor_emit(MOTOR_FL, rpm_FL, false); osDelay(10);
+    motor_emit(MOTOR_FR, rpm_FR, true);  osDelay(10);
+    motor_emit(MOTOR_RL, rpm_RL, false); osDelay(10);
+    motor_emit(MOTOR_RR, rpm_RR, true);  osDelay(10);
+
+    osDelay(50);  // ~100ms cycle
   }
 
   /* USER CODE END StartTask02 */
@@ -494,10 +552,43 @@ void StartDisplayTask(void const * argument)
 void StartServoTask(void const * argument)
 {
   /* USER CODE BEGIN StartServoTask */
-  /* Servo control disabled - USART6 now used for CommTask communication */
+  // Servo control via TIM2 PWM (50Hz)
+  //   Servo 1 = TIM2_CH2 = PA1
+  //   Servo 2 = TIM2_CH3 = PA2
+  //   PSC=83, ARR=19999 → 84MHz/84/20000 = 50Hz
+  //   1 count = 1µs, servo pulse range: 500-2500µs (0°-180°)
+  //   CCR = 500 + angle_deg * 2000 / 180
+  //
+  // Controlled by ARM command (TYPE_ARM, payload 3B):
+  //   [servo_id, angle_lo, angle_hi]
+  //   servo_id: 1 or 2
+  //   angle: uint16_t LE, 0-180 degrees
+
+  // Start PWM on both channels
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
+
+  // Center both servos at 90° on power-on (CCR=1500 = 1500µs)
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 1500);
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 1500);
+
   for(;;)
   {
-    osDelay(1);
+    if (g_arm_servo_pending) {
+      uint8_t id = g_arm_servo_id;
+      uint16_t angle = g_arm_servo_angle;
+      g_arm_servo_pending = 0;
+
+      // Convert angle (0-180) to PWM compare value (500-2500)
+      uint32_t ccr = 500 + (uint32_t)angle * 2000 / 180;
+
+      if (id == 1) {
+        __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, ccr);
+      } else if (id == 2) {
+        __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, ccr);
+      }
+    }
+    osDelay(10);
   }
   /* USER CODE END StartServoTask */
 }
@@ -512,10 +603,23 @@ void StartServoTask(void const * argument)
 void StartLightTask(void const * argument)
 {
   /* USER CODE BEGIN StartLightTask */
-  /* Infinite loop */
+  // 3 fill lights on TIM3 CH1(PB4) / CH2(PB5) / CH3(PB0), 1kHz PWM
+  Light_Init();
+  Light_SetAll(0);  // all off at power-on
+
   for(;;)
   {
-    osDelay(1);
+    if (g_light_pending) {
+      uint8_t id = g_light_pending_id;
+      uint8_t bright = g_light_pending_on ? 100 : 0;
+      if (id == 0) {
+        Light_SetAll(bright);
+      } else {
+        Light_SetBright(id, bright);
+      }
+      g_light_pending = 0;
+    }
+    osDelay(10);
   }
   /* USER CODE END StartLightTask */
 }
@@ -569,6 +673,36 @@ void StartPosMotorTask(void const * argument)
   }
 
   /* USER CODE END StartPosMotorTask */
+}
+
+/* USER CODE BEGIN Header_StartCommTask */
+/**
+* @brief Function implementing the CommTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartCommTask */
+void StartCommTask(void const * argument)
+{
+  /* USER CODE BEGIN StartCommTask */
+  // CommTask: 50Hz pose broadcast to upper PC via USART6
+  // Coordinate convention (matches OdomTask output):
+  //   x:     forward  positive  (m)
+  //   y:     left     positive  (m)
+  //   theta: CCW      positive  (rad), 0 at power-on heading
+  for(;;)
+  {
+    float x, y, theta;
+    __disable_irq();
+    x = g_odom_x;
+    y = g_odom_y;
+    theta = g_odom_theta;
+    __enable_irq();
+
+    SendPoseToPC(x, y, theta);
+    osDelay(20);  // 50Hz
+  }
+  /* USER CODE END StartCommTask */
 }
 
 /* Private application code --------------------------------------------------*/
