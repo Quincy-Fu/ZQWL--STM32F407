@@ -20,6 +20,7 @@
 #include "main.h"
 #include "cmsis_os.h"
 #include "can.h"
+#include "dma.h"
 #include "spi.h"
 #include "tim.h"
 #include "usart.h"
@@ -30,6 +31,7 @@
 
 #include "Emm_V5.h"
 #include "imu_uart.h"
+#include "uart_protocol.h"
 
 /* USER CODE END Includes */
 
@@ -51,6 +53,8 @@
 
 /* USER CODE BEGIN PV */
 
+uint8_t RxDMA_Buf[RX_BUF_SIZE];   // DMA receive buffer for USART6
+volatile uint8_t currentHalf = 0;
 
 /* USER CODE END PV */
 
@@ -63,6 +67,13 @@ void MX_FREERTOS_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+void SendPoseToPC(float x, float y, float theta)
+{
+    uint8_t frame[64];
+    uint16_t frame_len = PackPoseFrame(x, y, theta, frame);
+    HAL_UART_Transmit(&huart6, frame, frame_len, 100);
+}
 
 /* USER CODE END 0 */
 
@@ -94,6 +105,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_CAN1_Init();
   MX_SPI1_Init();
   MX_USART6_UART_Init();
@@ -103,13 +115,17 @@ int main(void)
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
 
-  USER_CAN1_Filter_Init();                                                                  // 初始化CAN过滤�???
+  USER_CAN1_Filter_Init();                                                                  // 初始化CAN过滤�????
   if(HAL_CAN_Start(&hcan1) != HAL_OK) { Error_Handler(); }                                  // 启动CAN外设
   if(HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) { Error_Handler(); }  // 使能CAN接收中断
 
-  // 启动 USART1 接收 (IMU 自动上报, 调度器启动前�??始避�?? ORE 错误)
+  // 启动 USART1 接收 (IMU 自动上报, 调度器启动前�???始避�??? ORE 错误)
   imu_uart_start_rx();
 
+  // 启动 USART6 DMA循环接收 (上位机�?�信)
+  HAL_UART_Receive_DMA(&huart6, RxDMA_Buf, RX_BUF_SIZE);
+  // 使能USART6空闲中断 (�?帧数据收完自动触�?)
+  __HAL_UART_ENABLE_IT(&huart6, UART_IT_IDLE);
 
   /* USER CODE END 2 */
 

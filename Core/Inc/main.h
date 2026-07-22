@@ -70,6 +70,16 @@ void Error_Handler(void);
 
 /* USER CODE BEGIN Private defines */
 
+typedef struct {
+    uint8_t data[128];
+    uint16_t len;
+} DataPacket_t;
+
+#define RX_BUF_SIZE  256
+
+extern uint8_t RxDMA_Buf[RX_BUF_SIZE];
+extern volatile uint8_t currentHalf;
+
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

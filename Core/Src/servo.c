@@ -4,18 +4,21 @@
 /* ============================================================
  * 2-servo angle control with quintic polynomial easing
  *
- * Servo 1: TIM2_CH3 (PA2)
- * Servo 2: TIM2_CH4 (PA3)
+ * Servo 1: TIM2_CH2 (PA1)
+ * Servo 2: TIM2_CH3 (PA2)
  *
- * Angle input: 0-2700 (0.1 deg units) -> pulse 500-2500 us
+ * Angle input: 0-1800 (0.1 deg units) -> pulse 500-2500 us
  * Easing: f(t) = 6t^5 - 15t^4 + 10t^3  (zero vel & accel at endpoints)
  *
  * Usage:
  *   Servo_Init();            // call once (starts PWM, centers servos)
- *   Servo_SetAngle(1, 900);  // servo 1 -> 90.0 deg (non-blocking)
- *   Servo_Update();          // call every 10ms in task loop
+ *   Servo_SetAngle(1, 900);  // servo 1 -> 90.0 deg (smooth easing)
+ *   Servo_Update();          // call every ~10ms in task loop
  * ============================================================
  */
+
+/* Pulse midpoint: safe center position for 180/270 deg servos */
+#define SERVO_PULSE_CENTER  ((SERVO_PULSE_MIN + SERVO_PULSE_MAX) / 2)  /* 1500 us */
 
 /* Per-servo easing state */
 typedef struct {
@@ -37,7 +40,7 @@ static float quintic_ease(float t)
     return t3 * (10.0f + t * (-15.0f + 6.0f * t));
 }
 
-/* angle_deg10 (0-2700) -> pulse (500-2500 us) */
+/* angle_deg10 (0-SERVO_ANGLE_MAX) -> pulse (500-2500 us) */
 static uint16_t angle_to_pulse(uint16_t angle_deg10)
 {
     if (angle_deg10 > SERVO_ANGLE_MAX) angle_deg10 = SERVO_ANGLE_MAX;
@@ -47,7 +50,7 @@ static uint16_t angle_to_pulse(uint16_t angle_deg10)
 }
 
 /**
- * @brief  Start TIM2 CH3+CH4 PWM, init easing state to min pulse
+ * @brief  Start TIM2 CH2+CH3 PWM, init to center position (1500 us)
  */
 void Servo_Init(void)
 {
@@ -56,21 +59,21 @@ void Servo_Init(void)
 
     for (int i = 0; i < 2; i++) {
         s_servo[i].easing       = false;
-        s_servo[i].cur_pulse    = SERVO_PULSE_MIN;
-        s_servo[i].start_pulse  = SERVO_PULSE_MIN;
-        s_servo[i].target_pulse = SERVO_PULSE_MIN;
+        s_servo[i].cur_pulse    = SERVO_PULSE_CENTER;
+        s_servo[i].start_pulse  = SERVO_PULSE_CENTER;
+        s_servo[i].target_pulse = SERVO_PULSE_CENTER;
         s_servo[i].start_tick   = 0;
-        s_servo[i].ease_dur_ms  = 600;
+        s_servo[i].ease_dur_ms  = 0;
     }
 
-    __HAL_TIM_SET_COMPARE(&htim2, SERVO1_CHANNEL, SERVO_PULSE_MIN);
-    __HAL_TIM_SET_COMPARE(&htim2, SERVO2_CHANNEL, SERVO_PULSE_MIN);
+    __HAL_TIM_SET_COMPARE(&htim2, SERVO1_CHANNEL, SERVO_PULSE_CENTER);
+    __HAL_TIM_SET_COMPARE(&htim2, SERVO2_CHANNEL, SERVO_PULSE_CENTER);
 }
 
 /**
  * @brief  Set target angle for a servo (non-blocking, starts easing)
  * @param  servo_id  1 or 2
- * @param  angle_deg10  target angle in 0.1 deg units (0-2700)
+ * @param  angle_deg10  target angle in 0.1 deg units (0-1800 = 0-180 deg)
  *
  * If a previous easing is still running, re-targets from the
  * current actual pulse position so motion stays continuous.
@@ -82,7 +85,7 @@ void Servo_SetAngle(uint8_t servo_id, uint16_t angle_deg10)
 
     uint16_t target = angle_to_pulse(angle_deg10);
 
-    /* Dynamic easing duration proportional to pulse difference */
+    /* Easing duration proportional to pulse difference */
     int32_t diff = (int32_t)target - (int32_t)s->cur_pulse;
     if (diff < 0) diff = -diff;
     s->ease_dur_ms = (uint32_t)((float)diff * SERVO_EASE_MS_PER_US);

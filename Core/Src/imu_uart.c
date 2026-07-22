@@ -19,7 +19,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         /* 继续接收下一字节 (维持接收循环) */
         HAL_UART_Receive_IT(&huart1, &s_rx_byte, 1);
     }
-    /* USART6 等其他 UART 不在这里处理, 留给各自驱动 */
+    /* USART6 DMA接收由stm32f4xx_it.c的IDLE中断管理, 不在这里处理 */
 }
 
 /* Send a command frame to IMU via USART1 TX.

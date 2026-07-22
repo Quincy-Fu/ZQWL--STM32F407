@@ -30,6 +30,7 @@
 #include "imu_protocol.h"
 #include "imu_uart.h"
 #include "lcd_ili9488.h"
+#include "uart_protocol.h"
 #include <math.h>
 #include <stdio.h>
 /* USER CODE END Includes */
@@ -182,7 +183,9 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
+  /* definition and creation of DataQueue */
+  osMessageQDef(DataQueue, 10, DataPacket_t);
+  DataQueueHandle = osMessageCreate(osMessageQ(DataQueue), NULL);
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -223,7 +226,9 @@ void MX_FREERTOS_Init(void) {
   PosMotorTaskHandle = osThreadCreate(osThread(PosMotorTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
+  /* definition and creation of CommTask */
+  osThreadDef(CommTask, StartCommTask, osPriorityNormal, 0, 256);
+  CommTaskHandle = osThreadCreate(osThread(CommTask), NULL);
   /* USER CODE END RTOS_THREADS */
 
 }
@@ -489,7 +494,7 @@ void StartDisplayTask(void const * argument)
 void StartServoTask(void const * argument)
 {
   /* USER CODE BEGIN StartServoTask */
-  /* Infinite loop */
+  /* Servo control disabled - USART6 now used for CommTask communication */
   for(;;)
   {
     osDelay(1);
