@@ -152,8 +152,8 @@ void USER_CAN1_Filter_Init(void)
 
 /**
 	* @brief   CAN发�?�多字节
-	* @param   cmd  命令缓冲（cmd[0]=addr，后续为功能�??+数据+0x6B�??
-	* @param   len  长度（含 addr �?? 0x6B�??
+	* @param   cmd  命令缓冲（cmd[0]=addr，后续为功能�??+数据+0x6B�??
+	* @param   len  长度（含 addr �?? 0x6B�??
 	*/
 void can_SendCmd(__IO uint8_t *cmd, uint8_t len)
 {
@@ -174,12 +174,12 @@ void can_SendCmd(__IO uint8_t *cmd, uint8_t len)
 		TxMsg.IDE = CAN_ID_EXT;
 		TxMsg.RTR = CAN_RTR_DATA;
 
-		// 小于8字节，最后一�??
+		// 小于8字节，最后一�??
 		if(k < 8)
 		{
 			for(l=0; l < k; l++,i++) { txData[l + 1] = cmd[i + 2]; } TxMsg.DLC = k + 1;
 		}
-		// 大于8字节，分包发送，每次�??多发8个字�??
+		// 大于8字节，分包发送，每次�??多发8个字�??
 		else
 		{
 			for(l=0; l < 7; l++,i++) { txData[l + 1] = cmd[i + 2]; } TxMsg.DLC = 8;
@@ -188,6 +188,9 @@ void can_SendCmd(__IO uint8_t *cmd, uint8_t len)
 		while(HAL_CAN_AddTxMessage(&hcan1, (CAN_TxHeaderTypeDef *)(&TxMsg), (uint8_t *)(&txData), (&TxMailbox)) != HAL_OK);
 
 		++packNum;
+		if (i < cmd[1]) {
+			HAL_Delay(10);  // inter-frame delay for Emm_V5 RX buffer spacing
+		}
 	}
 }
 

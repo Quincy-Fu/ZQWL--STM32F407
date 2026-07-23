@@ -114,6 +114,9 @@ volatile uint8_t g_imu_verified = 0;
 // Valid: 0..4 = target slot index (each slot = 72 deg, slot 0 = homing origin)
 volatile uint8_t g_target_gear = 0;
 
+// Turntable diagnostic counters
+volatile uint32_t g_pos_cmd_count = 0;   // CAN position commands sent
+volatile uint8_t  g_pos_homed     = 0;   // 1 = homing completed
 /* USER CODE END Variables */
 osThreadId defaultTaskHandle;
 osThreadId MotorTaskHandle;
@@ -661,6 +664,7 @@ void StartPosMotorTask(void const * argument)
   // to avoid contending with OdomTask over the single shared RX buffer (can.rxData).
   osDelay(POS_HOME_WAIT_MS);
 
+  g_pos_homed = 1;  // homing done
   uint8_t cur_gear = 0;  // after homing the mechanism is at slot 0
 
   for(;;) {
@@ -668,16 +672,16 @@ void StartPosMotorTask(void const * argument)
 
     if (tgt < POS_SLOT_COUNT && tgt != cur_gear) {
       // Absolute position move to slot tgt (= tgt * 72 deg from origin).
-      // The position command is 13 bytes -> split into 2 CAN packets by can_SendCmd;
-      // wrap in a critical section so OdomTask's S_CPOS frames cannot interleave
-      // between the two packets. (OdomTask's own sends are single-frame/atomic.)
-      taskENTER_CRITICAL();
+      // 13 bytes -> 2 CAN frames via can_SendCmd (with HAL_Delay(10) between frames).
+      // No critical section: motor addr 0x05 differs from OdomTask's 0x01-0x04,
+      // so CAN frame interleaving is harmless.
       Emm_V5_Pos_Control(POS_MOTOR_ADDR, 0 /*CW*/, POS_MOVE_VEL_RPM, POS_MOVE_ACC,
                          (uint32_t)tgt * POS_PULSES_PER_SLOT,
                          true  /*absolute*/,
                          false /*no sync*/);
-      taskEXIT_CRITICAL();
       cur_gear = tgt;
+      g_pos_cmd_count++;
+      osDelay(30);  // post-command cooldown: let motor driver process
     }
 
     osDelay(20);
@@ -688,6 +692,16 @@ void StartPosMotorTask(void const * argument)
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+
+// CommTask placeholder — in USART6 architecture, protocol parsing is done
+// by the IDLE interrupt handler in stm32f4xx_it.c (dispatch_frame).
+void StartCommTask(void const * argument)
+{
+  (void)argument;
+  for (;;) {
+    osDelay(1000);
+  }
+}
 
 // Signed RPM -> Emm_V5 velocity command (dir + abs vel)
 // Left motors: positive RPM -> dir=0(CW); Right (mirror): positive RPM -> dir=1(CCW)
