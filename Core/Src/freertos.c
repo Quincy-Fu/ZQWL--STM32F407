@@ -132,10 +132,8 @@ extern volatile uint8_t  g_light_pending_id;
 extern volatile uint8_t  g_light_pending_on;
 extern volatile uint8_t  g_light_pending;
 
-// ARM servo control: set by ISR dispatch, consumed by ServoTask
-extern volatile uint8_t  g_arm_servo_id;       // 1 or 2
-extern volatile uint16_t g_arm_servo_angle;    // 0-180 degrees
-extern volatile uint8_t  g_arm_servo_pending;  // 1=new command
+// ARM servo state control: set by ISR dispatch, consumed by ServoTask
+extern volatile uint8_t g_arm_state;  // 1-8 = predefined pose states
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
@@ -143,6 +141,10 @@ extern volatile uint8_t  g_arm_servo_pending;  // 1=new command
 // Signed RPM -> Emm_V5 velocity command (dir + abs vel)
 // is_right: right-side motors mirror-mounted, positive RPM -> dir=1(CCW)
 static void motor_emit(uint8_t addr, float rpm_signed, bool is_right);
+
+// CommTask / upper-PC communication
+void StartCommTask(void const * argument);
+void SendPoseToPC(float x, float y, float theta);
 
 /* USER CODE END FunctionPrototypes */
 
@@ -155,8 +157,6 @@ void StartDisplayTask(void const * argument);
 void StartServoTask(void const * argument);
 void StartLightTask(void const * argument);
 void StartPosMotorTask(void const * argument);
-void StartCommTask(void const * argument);
-void SendPoseToPC(float x, float y, float theta);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -552,44 +552,55 @@ void StartDisplayTask(void const * argument)
 void StartServoTask(void const * argument)
 {
   /* USER CODE BEGIN StartServoTask */
+
   // Servo control via TIM2 PWM (50Hz)
   //   Servo 1 = TIM2_CH2 = PA1
   //   Servo 2 = TIM2_CH3 = PA2
-  //   PSC=83, ARR=19999 → 84MHz/84/20000 = 50Hz
-  //   1 count = 1µs, servo pulse range: 500-2500µs (0°-180°)
+  //   1 count = 1us, servo pulse range: 500-2500us (0-180 deg)
   //   CCR = 500 + angle_deg * 2000 / 180
   //
-  // Controlled by ARM command (TYPE_ARM, payload 3B):
-  //   [servo_id, angle_lo, angle_hi]
-  //   servo_id: 1 or 2
-  //   angle: uint16_t LE, 0-180 degrees
+  // ARM command (TYPE_ARM, payload 1B): [state] = 1-8
+  // Each state maps to a predefined (servo1, servo2) angle pair.
+  // TODO: fill in actual angles for each state below.
 
-  // Start PWM on both channels
+  // State lookup: index 0 = power-on default, 1-8 = arm poses
+  // {servo1_angle, servo2_angle} in degrees (0-180)
+  static const uint8_t arm_poses[9][2] = {
+      { 90,  90},  // [0] power-on default
+      { 90,  90},  // [1] state 1 - TODO
+      { 90,  90},  // [2] state 2 - TODO
+      { 90,  90},  // [3] state 3 - TODO
+      { 90,  90},  // [4] state 4 - TODO
+      { 90,  90},  // [5] state 5 - TODO
+      { 90,  90},  // [6] state 6 - TODO
+      { 90,  90},  // [7] state 7 - TODO
+      { 90,  90},  // [8] state 8 - TODO
+  };
+
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
 
-  // Center both servos at 90° on power-on (CCR=1500 = 1500µs)
+  // Center both servos at 90 deg on power-on (CCR=1500)
   __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 1500);
   __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 1500);
 
+  uint8_t last_state = 0;
+
   for(;;)
   {
-    if (g_arm_servo_pending) {
-      uint8_t id = g_arm_servo_id;
-      uint16_t angle = g_arm_servo_angle;
-      g_arm_servo_pending = 0;
-
-      // Convert angle (0-180) to PWM compare value (500-2500)
-      uint32_t ccr = 500 + (uint32_t)angle * 2000 / 180;
-
-      if (id == 1) {
-        __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, ccr);
-      } else if (id == 2) {
-        __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, ccr);
-      }
+    uint8_t state = g_arm_state;
+    if (state >= 1 && state <= 8 && state != last_state) {
+      uint8_t a1 = arm_poses[state][0];
+      uint8_t a2 = arm_poses[state][1];
+      uint32_t ccr1 = 500 + (uint32_t)a1 * 2000 / 180;
+      uint32_t ccr2 = 500 + (uint32_t)a2 * 2000 / 180;
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, ccr1);
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, ccr2);
+      last_state = state;
     }
     osDelay(10);
   }
+  
   /* USER CODE END StartServoTask */
 }
 
@@ -673,36 +684,6 @@ void StartPosMotorTask(void const * argument)
   }
 
   /* USER CODE END StartPosMotorTask */
-}
-
-/* USER CODE BEGIN Header_StartCommTask */
-/**
-* @brief Function implementing the CommTask thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_StartCommTask */
-void StartCommTask(void const * argument)
-{
-  /* USER CODE BEGIN StartCommTask */
-  // CommTask: 50Hz pose broadcast to upper PC via USART6
-  // Coordinate convention (matches OdomTask output):
-  //   x:     forward  positive  (m)
-  //   y:     left     positive  (m)
-  //   theta: CCW      positive  (rad), 0 at power-on heading
-  for(;;)
-  {
-    float x, y, theta;
-    __disable_irq();
-    x = g_odom_x;
-    y = g_odom_y;
-    theta = g_odom_theta;
-    __enable_irq();
-
-    SendPoseToPC(x, y, theta);
-    osDelay(20);  // 50Hz
-  }
-  /* USER CODE END StartCommTask */
 }
 
 /* Private application code --------------------------------------------------*/

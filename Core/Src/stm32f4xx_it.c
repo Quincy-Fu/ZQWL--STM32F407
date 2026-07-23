@@ -72,13 +72,10 @@ volatile uint8_t g_light_pending_id = 0;   // 0=all, 1-3=specific light
 volatile uint8_t g_light_pending_on = 0;   // 0=off, 1=on
 volatile uint8_t g_light_pending    = 0;   // 1=new command pending
 
-// ARM servo pending flag (consumed by ServoTask)
-// ARM payload: [servo_id(1B), angle_lo(1B), angle_hi(1B)] = 3 bytes
-//   servo_id: 1 or 2 (TIM2 CH2=PA1 or CH3=PA2)
-//   angle: uint16_t LE, 0-180 degrees
-volatile uint8_t  g_arm_servo_id    = 0;   // 1 or 2
-volatile uint16_t g_arm_servo_angle = 0;   // 0-180 degrees
-volatile uint8_t  g_arm_servo_pending = 0; // 1=new command pending
+// ARM servo state (consumed by ServoTask)
+// ARM payload: [state(1B)] = 1 byte
+//   state: 1-8, each maps to a predefined (servo1_angle, servo2_angle) pair
+volatile uint8_t g_arm_state = 0;    // 0=none, 1-8=arm pose state
 
 static inline void dispatch_frame(uint8_t type, const uint8_t *payload, uint8_t len)
 {
@@ -95,13 +92,10 @@ static inline void dispatch_frame(uint8_t type, const uint8_t *payload, uint8_t 
         if (pos < 5) g_target_gear = pos;
         g_rx_rotate_count++;
     } else if (type == TYPE_ARM) {
-        if (len >= 3) {
-            uint8_t sid = payload[0];
-            uint16_t angle = (uint16_t)payload[1] | ((uint16_t)payload[2] << 8);
-            if (sid >= 1 && sid <= 2 && angle <= 180) {
-                g_arm_servo_id = sid;
-                g_arm_servo_angle = angle;
-                g_arm_servo_pending = 1;
+        if (len >= 1) {
+            uint8_t state = payload[0];
+            if (state >= 1 && state <= 8) {
+                g_arm_state = state;
             }
         }
         g_rx_arm_count++;
@@ -301,11 +295,11 @@ void USART6_IRQHandler(void)
   if (__HAL_UART_GET_FLAG(&huart6, UART_FLAG_IDLE) != RESET) {
     __HAL_UART_CLEAR_IDLEFLAG(&huart6);
 
-    // 计算DMA当前写位�?
+    // 计算DMA当前写位�??
     uint16_t write_pos = RX_BUF_SIZE
         - __HAL_DMA_GET_COUNTER(&hdma_usart6_rx);
 
-    // 处理新字�?
+    // 处理新字�??
     if (write_pos != dma_read_pos) {
       if (write_pos > dma_read_pos) {
         for (uint16_t i = dma_read_pos; i < write_pos; i++) {
@@ -316,7 +310,7 @@ void USART6_IRQHandler(void)
           }
         }
       } else {
-        // 缓冲区回�? (CIRCULAR模式或NORMAL重启�?)
+        // 缓冲区回�?? (CIRCULAR模式或NORMAL重启�??)
         for (uint16_t i = dma_read_pos; i < RX_BUF_SIZE; i++) {
           uint8_t out_type, out_payload[64], out_len;
           if (UartParser_FeedByte(&uart6_parser, RxDMA_Buf[i],
@@ -335,7 +329,7 @@ void USART6_IRQHandler(void)
       dma_read_pos = write_pos;
     }
 
-    // DMA NORMAL模式: 缓冲区满后DMA停止, �?要重�?
+    // DMA NORMAL模式: 缓冲区满后DMA停止, �??要重�??
     if (huart6.RxState == HAL_UART_STATE_READY) {
       dma_read_pos = 0;
       HAL_UART_Receive_DMA(&huart6, RxDMA_Buf, RX_BUF_SIZE);
