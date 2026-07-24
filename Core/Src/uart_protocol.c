@@ -148,3 +148,20 @@ bool UartParser_FeedByte(UartParser_t* parser, uint8_t byte,
     
     return false;
 }
+
+// Pack navigation result response: AA 55 [type] 01 [status] [crc_lo][crc_hi]
+// Returns total frame length (7 bytes). out_buf must have >= 8 bytes.
+uint16_t PackNavResult(uint8_t type, uint8_t status, uint8_t* out_buf)
+{
+    out_buf[0] = PROTOCOL_HEADER1;
+    out_buf[1] = PROTOCOL_HEADER2;
+    out_buf[2] = type;
+    out_buf[3] = 0x01;       // payload len = 1
+    out_buf[4] = status;
+
+    uint16_t crc = CRC16_CCITT(out_buf + 2, 3);  // type + len + payload
+    out_buf[5] = crc & 0xFF;
+    out_buf[6] = (crc >> 8) & 0xFF;
+
+    return 7;
+}

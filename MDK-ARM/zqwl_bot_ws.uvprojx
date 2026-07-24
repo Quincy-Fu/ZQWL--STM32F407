@@ -735,6 +735,16 @@
               <FileType>1</FileType>
               <FilePath>../Core/Src/stm32f4xx_hal_timebase_tim.c</FilePath>
             </File>
+            <File>
+              <FileName>move.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\move.c</FilePath>
+            </File>
+            <File>
+              <FileName>goto_pos.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\goto_pos.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

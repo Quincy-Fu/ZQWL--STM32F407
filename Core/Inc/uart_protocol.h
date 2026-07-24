@@ -15,6 +15,23 @@
 #define TYPE_ARM                 0x04
 #define TYPE_LIGHT               0x05
 
+// Navigation command types (Stage 3)
+// Even = command (PC->MCU), Odd = response (MCU->PC)
+#define TYPE_CMD_GOTO            0x10
+#define TYPE_CMD_GOTO_RESP       0x11
+#define TYPE_CMD_TOX             0x12
+#define TYPE_CMD_TOX_RESP        0x13
+#define TYPE_CMD_TOY             0x14
+#define TYPE_CMD_TOY_RESP        0x15
+#define TYPE_CMD_TURNTO          0x16
+#define TYPE_CMD_TURNTO_RESP     0x17
+#define TYPE_CMD_FINE_MOVE       0x18
+#define TYPE_CMD_FINE_RESP       0x19
+#define TYPE_CMD_SYNC_POSE       0x1A
+#define TYPE_CMD_SYNC_RESP       0x1B
+#define TYPE_CMD_ARC             0x1C
+#define TYPE_CMD_ARC_RESP        0x1D
+
 // ????payload?? (3?float)
 #define PAYLOAD_SIZE_VEL         12
 // ???payload?? (3?float)
@@ -54,5 +71,22 @@ typedef struct {
 
 void UartParser_Init(UartParser_t* parser);
 bool UartParser_FeedByte(UartParser_t* parser, uint8_t byte, uint8_t* out_type, uint8_t* out_payload, uint8_t* out_len);
+
+// Navigation packet: ISR -> NavTask via queue
+#define NAV_CMD_GOTO       0x01
+#define NAV_CMD_TOX        0x02
+#define NAV_CMD_TOY        0x03
+#define NAV_CMD_TURNTO     0x04
+#define NAV_CMD_FINE_MOVE  0x05
+#define NAV_CMD_SYNC_POSE  0x06
+#define NAV_CMD_ARC        0x07
+
+typedef struct {
+    uint8_t  cmd;
+    float    f[5];   // cmd-dependent parameters
+} NavPacket_t;
+
+// Pack a 1-byte result response frame
+uint16_t PackNavResult(uint8_t type, uint8_t status, uint8_t* out_buf);
 
 #endif

@@ -27,6 +27,7 @@
 #include "uart_protocol.h"
 #include <string.h>
 extern osMessageQId DataQueueHandle;
+extern osMessageQId NavQueueHandle;
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -66,6 +67,7 @@ volatile uint32_t g_rx_cmd_vel_count = 0;
 volatile uint32_t g_rx_rotate_count  = 0;
 volatile uint32_t g_rx_arm_count     = 0;
 volatile uint32_t g_rx_light_count   = 0;
+volatile uint32_t g_rx_nav_count     = 0;
 
 // LIGHT command pending flag (consumed by LightTask)
 volatile uint8_t g_light_pending_id = 0;   // 0=all, 1-3=specific light
@@ -106,6 +108,70 @@ static inline void dispatch_frame(uint8_t type, const uint8_t *payload, uint8_t 
             g_light_pending = 1;
         }
         g_rx_light_count++;
+    }
+    // --- Navigation commands -> NavQueue (Stage 3) ---
+    else if (type == TYPE_CMD_GOTO && len == 8) {
+        NavPacket_t nav; nav.cmd = NAV_CMD_GOTO;
+        memcpy(&nav.f[0], payload, 4);
+        memcpy(&nav.f[1], payload + 4, 4);
+        BaseType_t h = pdFALSE;
+        xQueueSendFromISR(NavQueueHandle, &nav, &h);
+        portYIELD_FROM_ISR(h);
+        g_rx_nav_count++;
+    }
+    else if (type == TYPE_CMD_TOX && len == 4) {
+        NavPacket_t nav; nav.cmd = NAV_CMD_TOX;
+        memcpy(&nav.f[0], payload, 4);
+        BaseType_t h = pdFALSE;
+        xQueueSendFromISR(NavQueueHandle, &nav, &h);
+        portYIELD_FROM_ISR(h);
+        g_rx_nav_count++;
+    }
+    else if (type == TYPE_CMD_TOY && len == 4) {
+        NavPacket_t nav; nav.cmd = NAV_CMD_TOY;
+        memcpy(&nav.f[0], payload, 4);
+        BaseType_t h = pdFALSE;
+        xQueueSendFromISR(NavQueueHandle, &nav, &h);
+        portYIELD_FROM_ISR(h);
+        g_rx_nav_count++;
+    }
+    else if (type == TYPE_CMD_TURNTO && len == 4) {
+        NavPacket_t nav; nav.cmd = NAV_CMD_TURNTO;
+        memcpy(&nav.f[0], payload, 4);
+        BaseType_t h = pdFALSE;
+        xQueueSendFromISR(NavQueueHandle, &nav, &h);
+        portYIELD_FROM_ISR(h);
+        g_rx_nav_count++;
+    }
+    else if (type == TYPE_CMD_FINE_MOVE && len == 8) {
+        NavPacket_t nav; nav.cmd = NAV_CMD_FINE_MOVE;
+        memcpy(&nav.f[0], payload, 4);
+        memcpy(&nav.f[1], payload + 4, 4);
+        BaseType_t h = pdFALSE;
+        xQueueSendFromISR(NavQueueHandle, &nav, &h);
+        portYIELD_FROM_ISR(h);
+        g_rx_nav_count++;
+    }
+    else if (type == TYPE_CMD_SYNC_POSE && len == 8) {
+        NavPacket_t nav; nav.cmd = NAV_CMD_SYNC_POSE;
+        memcpy(&nav.f[0], payload, 4);
+        memcpy(&nav.f[1], payload + 4, 4);
+        BaseType_t h = pdFALSE;
+        xQueueSendFromISR(NavQueueHandle, &nav, &h);
+        portYIELD_FROM_ISR(h);
+        g_rx_nav_count++;
+    }
+    else if (type == TYPE_CMD_ARC && len == 20) {
+        NavPacket_t nav; nav.cmd = NAV_CMD_ARC;
+        memcpy(&nav.f[0], payload, 4);
+        memcpy(&nav.f[1], payload + 4, 4);
+        memcpy(&nav.f[2], payload + 8, 4);
+        memcpy(&nav.f[3], payload + 12, 4);
+        memcpy(&nav.f[4], payload + 16, 4);
+        BaseType_t h = pdFALSE;
+        xQueueSendFromISR(NavQueueHandle, &nav, &h);
+        portYIELD_FROM_ISR(h);
+        g_rx_nav_count++;
     }
 }
 /* USER CODE END 0 */

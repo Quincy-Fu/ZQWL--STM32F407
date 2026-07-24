@@ -31,6 +31,8 @@
 #include "imu_uart.h"
 #include "lcd_ili9488.h"
 #include "uart_protocol.h"
+#include "move.h"
+#include "goto_pos.h"
 #include "light.h"
 #include "tim.h"
 #include <math.h>
@@ -88,17 +90,17 @@
 /* USER CODE BEGIN Variables */
 
 // ===== Velocity command input (float, set by CommTask DataQueue or Keil debugger) =====
-// Unit: vx,vy = m/s, omega = rad/s
-volatile float g_tgt_vx    = 0.0f;
-volatile float g_tgt_vy    = 0.0f;
-volatile float g_tgt_omega = 0.0f;
+// Unit: vx=right(m/s), vy=forward(m/s), omega=CW(rad/s)
+volatile float g_tgt_vx    = 0.0f;   // right+
+volatile float g_tgt_vy    = 0.0f;   // forward+
+volatile float g_tgt_omega = 0.0f;   // CW+
 
 // ===== Odometry output (THE core result) =====
-// Updated by OdomTask, read by CommTask / DisplayTask / Keil debugger
-// World frame, origin = power-on position & heading
-//   x: forward (m), y: left (m), theta: CCW heading (rad)
-volatile float g_odom_x     = 0.0f;   // position x (m)
-volatile float g_odom_y     = 0.0f;   // position y (m)
+// Updated by OdomTask (standby) / Move module (active), read by CommTask / DisplayTask
+// Blu3 field frame, origin = power-on position & heading
+//   x: right (m), y: forward (m), theta: CCW heading (rad) = g_imu_yaw
+volatile float g_odom_x     = 0.0f;   // position x (m), right+
+volatile float g_odom_y     = 0.0f;   // position y (m), forward+
 volatile float g_odom_theta = 0.0f;   // heading (rad), CCW positive
 
 // ===== IMU yaw (internal, used by OdomTask) =====
@@ -117,6 +119,10 @@ volatile uint8_t g_target_gear = 0;
 // Turntable diagnostic counters
 volatile uint32_t g_pos_cmd_count = 0;   // CAN position commands sent
 volatile uint8_t  g_pos_homed     = 0;   // 1 = homing completed
+
+// NavTask (Stage 3)
+osThreadId NavTaskHandle;
+osMessageQId NavQueueHandle;
 /* USER CODE END Variables */
 osThreadId defaultTaskHandle;
 osThreadId MotorTaskHandle;
@@ -148,6 +154,10 @@ static void motor_emit(uint8_t addr, float rpm_signed, bool is_right);
 // CommTask / upper-PC communication
 void StartCommTask(void const * argument);
 void SendPoseToPC(float x, float y, float theta);
+
+// NavTask / navigation command execution (Stage 3)
+void StartNavTask(void const * argument);
+void SendNavResultToPC(uint8_t type, uint8_t status);
 
 /* USER CODE END FunctionPrototypes */
 
@@ -205,6 +215,10 @@ void MX_FREERTOS_Init(void) {
   /* definition and creation of DataQueue */
   osMessageQDef(DataQueue, 10, DataPacket_t);
   DataQueueHandle = osMessageCreate(osMessageQ(DataQueue), NULL);
+
+  /* NavQueue: ISR -> NavTask (navigation commands, Stage 3) */
+  osMessageQDef(NavQueue, 5, NavPacket_t);
+  NavQueueHandle = osMessageCreate(osMessageQ(NavQueue), NULL);
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -248,6 +262,10 @@ void MX_FREERTOS_Init(void) {
   /* definition and creation of CommTask */
   osThreadDef(CommTask, StartCommTask, osPriorityNormal, 0, 256);
   CommTaskHandle = osThreadCreate(osThread(CommTask), NULL);
+
+  /* NavTask: executes blocking navigation commands (Stage 3) */
+  osThreadDef(NavTask, StartNavTask, osPriorityNormal, 0, 512);
+  NavTaskHandle = osThreadCreate(osThread(NavTask), NULL);
   /* USER CODE END RTOS_THREADS */
 
 }
@@ -321,22 +339,27 @@ void StartTask02(void const * argument)
       __enable_irq();
     }
 
-    float vx = g_tgt_vx;    // m/s
-    float vy = g_tgt_vy;    // m/s
-    float w  = g_tgt_omega;  // rad/s
+    // CMD_VEL convention: vx=right(+), vy=forward(+), w=CW(+)
+    // Map to MotorTask internal (vx_fwd=vy, vy_left=-vx, w_CCW=-w):
+    float vx = g_tgt_vy;     // forward = vy_new
+    float vy = -g_tgt_vx;    // left = -(right)
+    float w  = -g_tgt_omega; // CCW = -(CW)
 
     // Inverse kinematics: body velocity -> 4 wheel RPM
-    // vx=forward(+), vy=left(+), w=CCW(+); right-side motors mirror-mounted
+    // right-side motors mirror-mounted
     float rpm_FL = (vx - vy - L_SUM_M * w) * RPM_PER_MPS;
     float rpm_FR = (vx + vy + L_SUM_M * w) * RPM_PER_MPS;
     float rpm_RL = (vx + vy - L_SUM_M * w) * RPM_PER_MPS;
     float rpm_RR = (vx - vy + L_SUM_M * w) * RPM_PER_MPS;
 
-    // Send CAN velocity commands (10ms spacing to prevent frame loss)
-    motor_emit(MOTOR_FL, rpm_FL, false); osDelay(10);
-    motor_emit(MOTOR_FR, rpm_FR, true);  osDelay(10);
-    motor_emit(MOTOR_RL, rpm_RL, false); osDelay(10);
-    motor_emit(MOTOR_RR, rpm_RR, true);  osDelay(10);
+    // Stage 3: skip CAN output when Move module is controlling motors
+    if (!g_move_active) {
+      // Send CAN velocity commands (10ms spacing to prevent frame loss)
+      motor_emit(MOTOR_FL, rpm_FL, false); osDelay(10);
+      motor_emit(MOTOR_FR, rpm_FR, true);  osDelay(10);
+      motor_emit(MOTOR_RL, rpm_RL, false); osDelay(10);
+      motor_emit(MOTOR_RR, rpm_RR, true);  osDelay(10);
+    }
 
     osDelay(50);  // ~100ms cycle
   }
@@ -368,6 +391,15 @@ void StartOdomTask(void const * argument)
   osDelay(2500);
 
   for(;;) {
+    // Stage 3: skip CAN read when Move module is controlling motors.
+    // Reset baseline so OdomTask resumes cleanly without double-counting
+    // the encoder movement that Move already integrated.
+    if (g_move_active) {
+      has_last = false;
+      osDelay(20);
+      continue;
+    }
+
     // 1. Send S_CPOS read command to current motor
     Emm_V5_Read_Sys_Params(addr_map[cur_motor], S_CPOS);
 
@@ -408,18 +440,20 @@ void StartOdomTask(void const * argument)
         float d_RR = -(float)(cur_pos[3] - last_pos[3]) * ENC_TO_M;
 
         // Mecanum forward kinematics -> body-frame displacement
-        float dx_body = (d_FL + d_FR + d_RL + d_RR) * 0.25f;
-        float dy_body = (-d_FL + d_FR + d_RL - d_RR) * 0.25f;
+        // (must match move.c move_update_odom exactly)
+        float dx_body = (d_FL - d_FR - d_RL + d_RR) * 0.25f;  // right
+        float dy_body = (d_FL + d_FR + d_RL + d_RR) * 0.25f;  // forward
 
         // Heading from IMU (g_imu_yaw in degrees -> radians for trig)
         float theta = g_imu_yaw * 0.01745329f;
 
-        // Rotate body -> world frame and accumulate
+        // Rotate body -> world frame (X=right, Y=forward, theta=CCW)
+        // Same rotation as move.c move_update_odom
         float ct = cosf(theta);
         float st = sinf(theta);
         __disable_irq();
-        g_odom_x     += dx_body * ct - dy_body * st;
-        g_odom_y     += dx_body * st + dy_body * ct;
+        g_odom_x     += dx_body * ct + dy_body * st;   // right
+        g_odom_y     += -dx_body * st + dy_body * ct;  // forward
         g_odom_theta  = theta;
         __enable_irq();
       }
@@ -514,6 +548,7 @@ void StartImuTask(void const * argument)
 void StartDisplayTask(void const * argument)
 {
   /* USER CODE BEGIN StartDisplayTask */
+  extern volatile uint32_t g_rx_nav_count;
   LCD_Init();
 
   LCD_Clear(LCD_BLACK);
@@ -522,8 +557,9 @@ void StartDisplayTask(void const * argument)
   for(;;)
   {
     float ox, oy, ot, iy;
-    uint8_t imu_ok;
-    uint32_t fc;
+    float mx, my, myaw;
+    uint8_t imu_ok, mact;
+    uint32_t fc, navcnt;
     __disable_irq();
     ox = g_odom_x;
     oy = g_odom_y;
@@ -531,6 +567,11 @@ void StartDisplayTask(void const * argument)
     iy = g_imu_yaw;
     imu_ok = g_imu_verified;
     fc = imu_frame_count;
+    mact = g_move_active;
+    navcnt = g_rx_nav_count;
+    mx = move_x;
+    my = move_y;
+    myaw = move_yaw;
     __enable_irq();
 
     LCD_Print(10, 10, "-- ZQWL ODOMETRY --", LCD_CYAN, LCD_BLACK);
@@ -550,6 +591,12 @@ void StartDisplayTask(void const * argument)
     LCD_Print(10, 110, buf, LCD_WHITE, LCD_BLACK);
     snprintf(buf, sizeof(buf), "THETA: %.3f RAD", (double)ot);
     LCD_Print(10, 130, buf, LCD_WHITE, LCD_BLACK);
+
+    snprintf(buf, sizeof(buf), "NAV:%s N:%lu",
+             mact ? "ACT" : "IDL", (unsigned long)navcnt);
+    LCD_Print(10, 160, buf, LCD_MAGENTA, LCD_BLACK);
+    snprintf(buf, sizeof(buf), "MV:%.3f %.3f", (double)mx, (double)my);
+    LCD_Print(10, 180, buf, LCD_MAGENTA, LCD_BLACK);
 
     osDelay(200);  // ~5Hz refresh
   }
@@ -704,6 +751,79 @@ void StartPosMotorTask(void const * argument)
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+
+extern UART_HandleTypeDef huart6;
+
+// NavTask: blocking navigation command execution (Stage 3)
+// Receives NavPacket_t from ISR via NavQueue, calls Move/Goto layer,
+// sends result back to upper PC via USART6.
+void StartNavTask(void const * argument)
+{
+  (void)argument;
+
+  for (;;) {
+    NavPacket_t nav;
+    if (xQueueReceive(NavQueueHandle, &nav, portMAX_DELAY) == pdTRUE) {
+      g_move_active = 1;
+      uint8_t result = 0;
+
+      switch (nav.cmd) {
+        case NAV_CMD_GOTO:
+          result = ToPointClose(nav.f[0], nav.f[1]);
+          SendNavResultToPC(TYPE_CMD_GOTO_RESP, result);
+          break;
+
+        case NAV_CMD_TOX:
+          ToX(nav.f[0]);
+          SendNavResultToPC(TYPE_CMD_TOX_RESP, 1);
+          break;
+
+        case NAV_CMD_TOY:
+          ToY(nav.f[0]);
+          SendNavResultToPC(TYPE_CMD_TOY_RESP, 1);
+          break;
+
+        case NAV_CMD_TURNTO:
+          result = RotateTo(nav.f[0], MOVE_YAW_TURN_LIMIT);
+          SendNavResultToPC(TYPE_CMD_TURNTO_RESP, result);
+          break;
+
+        case NAV_CMD_FINE_MOVE: {
+          float tx = move_x + nav.f[0] * 0.001f;
+          float ty = move_y + nav.f[1] * 0.001f;
+          result = MoveToAccurateTimed(tx, ty, GOTO_CORRECT_SPEED,
+                                       GOTO_CORRECT_TOL, 2500);
+          SendNavResultToPC(TYPE_CMD_FINE_RESP, result);
+          break;
+        }
+
+        case NAV_CMD_SYNC_POSE:
+          Move_InitPose(nav.f[0], nav.f[1], g_imu_yaw);
+          SendNavResultToPC(TYPE_CMD_SYNC_RESP, 1);
+          break;
+
+        case NAV_CMD_ARC:
+          result = MoveArc(nav.f[0], nav.f[1], nav.f[2],
+                           nav.f[3], nav.f[4], MOVE_ARC_SPEED);
+          SendNavResultToPC(TYPE_CMD_ARC_RESP, result);
+          break;
+
+        default:
+          break;
+      }
+
+      g_move_active = 0;
+    }
+  }
+}
+
+// Send 1-byte navigation result response to upper PC
+void SendNavResultToPC(uint8_t type, uint8_t status)
+{
+  uint8_t buf[8];
+  uint16_t len = PackNavResult(type, status, buf);
+  HAL_UART_Transmit(&huart6, buf, len, 50);
+}
 
 // CommTask: send odometry pose to upper PC at 50Hz via USART6
 void StartCommTask(void const * argument)
