@@ -27,6 +27,10 @@ static volatile float s_yaw = 0.0f;
 static volatile uint8_t s_yaw_zeroed = 0;
 static volatile float   s_yaw_offset = 0.0f;
 
+/* Angle unwrapping: track continuous yaw across ±pi boundary */
+static volatile float s_yaw_prev_raw = 0.0f;
+static volatile float s_yaw_unwrapped = 0.0f;  /* accumulated radians */
+
 /* 调试变量 */
 volatile uint8_t  imu_last_func         = 0;
 volatile uint32_t imu_frame_count       = 0;
@@ -70,15 +74,25 @@ static void parse_frame(uint8_t func, const uint8_t *data, uint8_t data_len)
     switch (func) {
         case IMU_FUNC_EULER:
             /* roll @ data[0..3], pitch @ data[4..7], yaw @ data[8..11]
-             * IMU 上报弧度, 转成角度存 (g_imu_yaw 单位度, 更直观) */
+             * IMU reports radians [-pi, +pi]. Unwrap for continuous heading. */
             if (data_len >= 12) {
                 float raw = to_float(&data[8]);
                 imu_raw_yaw = raw;  /* debug: raw yaw in radians */
                 if (!s_yaw_zeroed) {
-                    s_yaw_offset = raw;   /* first valid frame defines 0 deg */
+                    s_yaw_offset = raw;
+                    s_yaw_prev_raw = raw;
+                    s_yaw_unwrapped = 0.0f;
                     s_yaw_zeroed = 1;
+                } else {
+                    /* Compute delta and wrap to [-pi, +pi] */
+                    float delta = raw - s_yaw_prev_raw;
+                    if (delta > 3.14159265f)       delta -= 6.28318530f;
+                    else if (delta < -3.14159265f)  delta += 6.28318530f;
+                    s_yaw_unwrapped += delta;
+                    s_yaw_prev_raw = raw;
                 }
-                s_yaw = (raw - s_yaw_offset) * 57.2957795f;
+                /* Output in degrees, relative to power-on heading */
+                s_yaw = (s_yaw_unwrapped) * 57.2957795f;
             }
             break;
         /* 其他功能码暂不解析 (用户只要 yaw, YAGNI) */

@@ -293,19 +293,31 @@ void StartTask02(void const * argument)
   // Velocity control loop
   // g_tgt_vx/vy/omega: set by DataQueue (upper PC CMD_VEL) or Keil debugger
   // Unit: vx,vy = m/s, omega = rad/s
+  TickType_t last_cmd_tick = xTaskGetTickCount();
+  #define VEL_CMD_TIMEOUT_MS  500  // auto-stop if no CMD_VEL for 500ms
+
   for(;;) {
     // Check DataQueue for new velocity commands (non-blocking)
-    osEvent evt = osMessageGet(DataQueueHandle, 0);
-    if (evt.status == osEventMessage) {
-      DataPacket_t *pkt = (DataPacket_t *)evt.value.p;
+    DataPacket_t pkt;
+    if (xQueueReceive(DataQueueHandle, &pkt, 0) == pdTRUE) {
       float vx, vy, w;
-      memcpy(&vx, pkt->data,     4);
-      memcpy(&vy, pkt->data + 4, 4);
-      memcpy(&w,  pkt->data + 8, 4);
+      memcpy(&vx, pkt.data,     4);
+      memcpy(&vy, pkt.data + 4, 4);
+      memcpy(&w,  pkt.data + 8, 4);
       __disable_irq();
       g_tgt_vx    = vx;
       g_tgt_vy    = vy;
       g_tgt_omega = w;
+      __enable_irq();
+      last_cmd_tick = xTaskGetTickCount();
+    }
+
+    // Safety: auto-stop if no CMD_VEL received within timeout
+    if ((xTaskGetTickCount() - last_cmd_tick) > pdMS_TO_TICKS(VEL_CMD_TIMEOUT_MS)) {
+      __disable_irq();
+      g_tgt_vx    = 0.0f;
+      g_tgt_vy    = 0.0f;
+      g_tgt_omega = 0.0f;
       __enable_irq();
     }
 
@@ -693,13 +705,21 @@ void StartPosMotorTask(void const * argument)
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
 
-// CommTask placeholder — in USART6 architecture, protocol parsing is done
-// by the IDLE interrupt handler in stm32f4xx_it.c (dispatch_frame).
+// CommTask: send odometry pose to upper PC at 50Hz via USART6
 void StartCommTask(void const * argument)
 {
   (void)argument;
   for (;;) {
-    osDelay(1000);
+    float px, py, pt;
+    __disable_irq();
+    px = g_odom_x;
+    py = g_odom_y;
+    // Read IMU yaw directly (always current, even when stationary)
+    // g_imu_yaw is in degrees, CCW positive, zero at power-on
+    pt = g_imu_yaw * 0.01745329f;  // deg -> rad
+    __enable_irq();
+    SendPoseToPC(px, py, pt);
+    osDelay(20);  // 50Hz
   }
 }
 
