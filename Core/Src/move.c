@@ -141,7 +141,7 @@ static void move_set_one_wheel(uint8_t idx, float mps)
  */
 static void move_set_wheels(const float w[4])
 {
-    /* 逐轮发送 (snF=true, 等待同步触发) */
+    /* 逐轮发送 (snF=false, 立即执行, 与MotorTask一致) */
     for (uint8_t i = 0; i < 4; i++) {
         float rpm = w[i] * MOVE_RPM_PER_MPS;
         cmd_wheel_rpm[i] = rpm;
@@ -153,11 +153,9 @@ static void move_set_wheels(const float w[4])
         uint16_t vel = (uint16_t)(r >= 0 ? r : -r);
         if (vel > MOVE_MOTOR_VEL_LIMIT) vel = MOVE_MOTOR_VEL_LIMIT;
 
-        Emm_V5_Vel_Control(wheel_addr[i], dir, vel, MOVE_ACC_DEFAULT, true);
+        Emm_V5_Vel_Control(wheel_addr[i], dir, vel, MOVE_ACC_DEFAULT, false);
         move_delay(MOVE_CMD_DELAY_MS);
     }
-    /* 广播同步触发 */
-    Emm_V5_Synchronous_motion(0x00);
 }
 
 /* ================================================================
@@ -315,7 +313,7 @@ void Move_ResetPose(void)
  *
  * @param vx  右移速度 m/s
  * @param vy  前进速度 m/s
- * @param wz  旋转分量 m/s (轮速当量, 非rad/s)
+ * @param wz  旋转分量 m/s (CW正, 正=顺时针旋转)
  */
 void Move_SetRobotVelocity(float vx, float vy, float wz)
 {
@@ -344,15 +342,15 @@ void Move_SetRobotVelocity(float vx, float vy, float wz)
  * @brief  场坐标系速度 → 体坐标系 → 4轮 → CAN
  *
  * 外部约定: +X=右, +Y=前, wz>0=CW
- * 与Blu3场坐标(dx=右, dy=前, CCW正)方向一致, 仅yaw/wz取反.
- *
+ * 运动学层wz也是CW正, 直接传入.
+
  * @param vx_f  场坐标右移速度 m/s (+X=右)
  * @param vy_f  场坐标前进速度 m/s (+Y=前)
  * @param wz    旋转分量 m/s (CW正)
  */
 void Move_SetFieldVelocity(float vx_f, float vy_f, float wz)
 {
-    /* 外部X(右)/Y(前)与Blu3场坐标dx(右)/dy(前)同向, 无需取反 */
+    /* 外部X(右)/Y(前)直接对应体坐标方向, 仅做场→体旋转 */
     float blu3_vx_f = vx_f;   /* 右 → 右 */
     float blu3_vy_f = vy_f;   /* 前 → 前 */
 
@@ -363,7 +361,7 @@ void Move_SetFieldVelocity(float vx_f, float vy_f, float wz)
     float vx_body =  blu3_vx_f * ci + blu3_vy_f * si;
     float vy_body = -blu3_vx_f * si + blu3_vy_f * ci;
 
-    Move_SetRobotVelocity(vx_body, vy_body, -wz);  /* -wz: CW→CCW */
+    Move_SetRobotVelocity(vx_body, vy_body, wz);  /* wz已是CW+, 运动学CW+直接传 */
 }
 
 /* ================================================================
@@ -459,13 +457,13 @@ uint8_t MoveToAccurateTimed(float tx, float ty, float max_speed,
         float vx_f = (dx / dist) * speed;   /* 右移分量 */
         float vy_f = (dy / dist) * speed;   /* 前进分量 */
 
-        /* 6. Yaw保持 (内部用CCW正: -move_target_yaw vs -g_imu_yaw) */
+        /* 6. Yaw保持: err是CCW+, 取反→CW+给SetFieldVelocity */
         float yaw_err = (-move_target_yaw) - g_imu_yaw;
         float wz = yaw_err * MOVE_YAW_KP;
         wz = move_clamp(wz, -MOVE_YAW_HOLD_LIMIT, MOVE_YAW_HOLD_LIMIT);
 
-        /* 7. 发送速度 */
-        Move_SetFieldVelocity(vx_f, vy_f, wz);
+        /* 7. 发送速度 (-wz: CCW→CW) */
+        Move_SetFieldVelocity(vx_f, vy_f, -wz);
 
         /* 8. 同步里程计到全局 (CommTask用) */
         move_sync_to_odom();
@@ -518,8 +516,9 @@ uint8_t RotateToTimed(float target_yaw_deg, float max_speed,
         move_read_all_encoders(cur_pos);
         move_update_odom(cur_pos);
 
-        /* 航向误差 (内部CCW正: -target外部 → 内部) */
-        float err = (-target_yaw_deg) - g_imu_yaw;
+        /* 航向误差: CCW正, 正→左转(CCW), 负→右转(CW)
+         * err = imu(CCW+) - target(CCW+) = g_imu_yaw - (-target_yaw_deg) */
+        float err = g_imu_yaw - (-target_yaw_deg);
         if (move_abs(err) <= MOVE_YAW_TOL_DEG) {
             Move_Stop();
             move_yaw = -g_imu_yaw;   /* CW正 = -IMU */
@@ -631,12 +630,12 @@ uint8_t MoveToAxisLockTimed(float tx, float ty,
             vy_f = main_sign * main_spd;  /* 主轴=Y(前) */
         }
 
-        /* Yaw保持 (内部CCW正: -move_target_yaw vs -g_imu_yaw) */
+        /* Yaw保持: err是CCW+, 取反→CW+给SetFieldVelocity */
         float yaw_err = (-move_target_yaw) - g_imu_yaw;
         float wz = yaw_err * MOVE_YAW_KP;
         wz = move_clamp(wz, -MOVE_YAW_HOLD_LIMIT, MOVE_YAW_HOLD_LIMIT);
 
-        Move_SetFieldVelocity(vx_f, vy_f, wz);
+        Move_SetFieldVelocity(vx_f, vy_f, -wz);
         move_sync_to_odom();
         move_delay(MOVE_CTRL_PERIOD_MS);
     }
@@ -762,6 +761,8 @@ uint8_t MoveArc(float cx, float cy, float radius,
         float wz = yaw_err * MOVE_YAW_KP;
         wz = move_clamp(wz, -MOVE_YAW_HOLD_LIMIT, MOVE_YAW_HOLD_LIMIT);
 
+        /* MoveArc中wz已经是CW+(target_yaw和move_yaw都是CW+),
+         * SetFieldVelocity现在直接传CW+给SetRobotVelocity, 无需取反 */
         Move_SetFieldVelocity(vx_f, vy_f, wz);
         move_sync_to_odom();
         move_delay(MOVE_CTRL_PERIOD_MS);

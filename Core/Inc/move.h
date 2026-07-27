@@ -15,9 +15,9 @@
  *   move_x/y = 场坐标 m, move_yaw = 偏航角(度, CW正, 上电=0°)
  *
  * 内部实现:
- *   运动学/电机层使用Blu3体坐标(dy=前进, dx=右移, CCW正),
- *   IMU(g_imu_yaw)也是CCW正.
- *   仅在场坐标边界做yaw符号映射: 外部θ(CW)=-内部θ(CCW).
+ *   运动学/电机层使用Blu3体坐标(dy=前进, dx=右移, CW正),
+ *   IMU(g_imu_yaw)是CCW正.
+ *   场坐标边界做yaw符号映射: 外部θ(CW)=-内部θ(CCW).
  *   X(右)/Y(前)与Blu3场坐标dx(右)/dy(前)方向一致, 无需取反.
  */
 
@@ -65,7 +65,7 @@
 /* 电机 */
 #define MOVE_ACC_DEFAULT        10     /* Emm_V5加速度参数 */
 #define MOVE_MOTOR_VEL_LIMIT    5000   /* RPM 上限 */
-#define MOVE_CMD_DELAY_MS       2      /* 电机间CAN发帧间隔 */
+#define MOVE_CMD_DELAY_MS       10     /* 电机间CAN发帧间隔 (≥10ms, Emm_V5硬件约束) */
 #define MOVE_READ_TIMEOUT_MS    20     /* S_CPOS回读超时 */
 
 /* 控制环 */
