@@ -21,10 +21,13 @@
 #define PMW_CS_LOW()    HAL_GPIO_WritePin(SPI1_CS3_GPIO_Port, SPI1_CS3_Pin, GPIO_PIN_RESET)
 #define PMW_CS_HIGH()   HAL_GPIO_WritePin(SPI1_CS3_GPIO_Port, SPI1_CS3_Pin, GPIO_PIN_SET)
 
-/* 安装参数 (改这里) */
-#define PMW_HEIGHT_M            0.10f           /* 镜头距地面 10cm */
-#define PMW_RESOLUTION_M        0.002131946f    /* 1m 高度下 1 像素 = 0.002131946 m (datasheet Appendix A) */
-#define PMW_PIX_TO_M            (PMW_RESOLUTION_M * PMW_HEIGHT_M)  /* 1 像素对应的实际位移 m */
+/* 安装参数 — 默认值 (标定后由 oflow_calib 更新运行时变量) */
+#define PMW_HEIGHT_DEFAULT_M        0.10f           /* 镜头距地面 ~10cm (参考, 待标定) */
+#define PMW_RESOLUTION_M            0.002131946f    /* 1m 高度下 1 像素 = 0.002131946 m (datasheet) */
+#define PMW_PIX_TO_M_DEFAULT        (PMW_RESOLUTION_M * PMW_HEIGHT_DEFAULT_M)
+
+/* 运行时变量 (标定模块可修改, 其他模块只读) */
+extern float pmw_pix_to_m;     /* 当前生效的 像素→米 比例系数 */
 
 /* 关键寄存器地址 (datasheet Table 9) */
 #define PMW_REG_PRODUCT_ID      0x00    /* RO, 复位 0x49 */

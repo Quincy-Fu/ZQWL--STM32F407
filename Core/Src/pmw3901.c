@@ -8,6 +8,9 @@
 volatile uint8_t pmw_init_step    = 0;
 volatile uint8_t pmw_debug_reg_val = 0;
 
+/* 像素→米比例系数 (运行时可由 oflow_calib 更新) */
+float pmw_pix_to_m = PMW_PIX_TO_M_DEFAULT;
+
 /* ============================================================
  * PMW3901MB-TXQT 光流传感器驱动
  * 严格依据 datasheet POT0189-PMW3901MB-TXQT-DS-R1.10

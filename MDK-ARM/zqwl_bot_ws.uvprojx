@@ -401,6 +401,16 @@
               <FilePath>..\Core\Src\pmw3901.c</FilePath>
             </File>
             <File>
+              <FileName>oflow.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\oflow.c</FilePath>
+            </File>
+            <File>
+              <FileName>oflow_calib.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\oflow_calib.c</FilePath>
+            </File>
+            <File>
               <FileName>imu_protocol.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Core\Src\imu_protocol.c</FilePath>

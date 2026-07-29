@@ -62,7 +62,7 @@ volatile uint8_t currentHalf = 0;
 void SystemClock_Config(void);
 void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
-
+extern osMutexId Uart6MutexHandle;
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -70,14 +70,12 @@ void MX_FREERTOS_Init(void);
 
 void SendPoseToPC(float x, float y, float theta)
 {
-    // Blu3 field frame:
-    //   x: right (+), unit: meter
-    //   y: forward (+), unit: meter
-    //   theta: CCW heading (+), unit: radian (= g_imu_yaw)
-    //   Origin: power-on position and heading (0, 0, 0)
     uint8_t frame[64];
     uint16_t frame_len = PackPoseFrame(x, y, theta, frame);
-    HAL_UART_Transmit(&huart6, frame, frame_len, 100);
+    if (osMutexWait(Uart6MutexHandle, 100) == osOK) {
+        HAL_UART_Transmit(&huart6, frame, frame_len, 100);
+        osMutexRelease(Uart6MutexHandle);
+    }
 }
 
 /* USER CODE END 0 */

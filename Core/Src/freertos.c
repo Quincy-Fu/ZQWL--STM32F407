@@ -33,6 +33,7 @@
 #include "uart_protocol.h"
 #include "move.h"
 #include "goto_pos.h"
+#include "oflow.h"
 #include "light.h"
 #include "tim.h"
 #include <math.h>
@@ -123,6 +124,9 @@ volatile uint8_t  g_pos_homed     = 0;   // 1 = homing completed
 // NavTask (Stage 3)
 osThreadId NavTaskHandle;
 osMessageQId NavQueueHandle;
+
+// USART6 mutex: protects concurrent HAL_UART_Transmit between CommTask and NavTask
+osMutexId Uart6MutexHandle;
 /* USER CODE END Variables */
 osThreadId defaultTaskHandle;
 osThreadId MotorTaskHandle;
@@ -200,7 +204,8 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END Init */
 
   /* USER CODE BEGIN RTOS_MUTEX */
-  /* add mutexes, ... */
+  osMutexDef(Uart6Mutex);
+  Uart6MutexHandle = osMutexCreate(osMutex(Uart6Mutex));
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
@@ -482,8 +487,8 @@ void StartOptFlowTask(void const * argument)
 {
   /* USER CODE BEGIN StartOptFlowTask */
 
-  // PMW3901 optical flow not in use; suspend immediately
-  vTaskSuspend(NULL);
+  // PMW3901 光流处理: 初始化传感器 → 10ms 采样 → 偏心补偿 → 独立里程计
+  OFlow_TaskLoop();
 
   /* USER CODE END StartOptFlowTask */
 }
@@ -817,12 +822,15 @@ void StartNavTask(void const * argument)
   }
 }
 
-// Send 1-byte navigation result response to upper PC
+// Send 1-byte navigation result response to upper PC (mutex-protected)
 void SendNavResultToPC(uint8_t type, uint8_t status)
 {
   uint8_t buf[8];
   uint16_t len = PackNavResult(type, status, buf);
-  HAL_UART_Transmit(&huart6, buf, len, 50);
+  if (osMutexWait(Uart6MutexHandle, 100) == osOK) {
+    HAL_UART_Transmit(&huart6, buf, len, 50);
+    osMutexRelease(Uart6MutexHandle);
+  }
 }
 
 // CommTask: send odometry pose to upper PC at 50Hz via USART6

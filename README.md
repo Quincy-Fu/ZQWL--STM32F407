@@ -13,7 +13,7 @@ STM32F407ZGT6 + FreeRTOS + CubeMX，麦轮底盘下位机。
 | 外设 | 引脚 | 速率 | 用途 |
 |------|------|------|------|
 | CAN1 | PB8=RX, PB9=TX | 500kbps | 4× Emm_V5.0 闭环步进电机 |
-| SPI1 | PA5=SCK, PA6=MISO, PA7=MOSI | 2.625Mbps Mode 3 | PMW3901 光流传感器（当前挂起未用） |
+| SPI1 | PA5=SCK, PA6=MISO, PA7=MOSI | 2.625Mbps Mode 3 | PMW3901 光流传感器 |
 | SPI2 | PB13=SCK, PB14=MISO, PB15=MOSI | 5.25Mbps Mode 0 | ILI9488 3.5" LCD (320×480) |
 | USART1 | PA9=TX, PA10=RX | 115200 8N1 | 9 轴 IMU (0x7E 0x23 协议) |
 | USART6 | PC6=TX, PC7=RX | 115200 8N1 | 预留 |
@@ -28,7 +28,7 @@ GPIO: PD9=LCD_CS, PD10=LCD_RST, PD11=LCD_DC, PD12=LCD_LED（开机置高点亮�
 | 文件 | 说明 |
 |------|------|
 | `Emm_V5.h` | 电机 CAN 协议库。地址宏 (0x01~0x04)、`SysParams_t` 参数索引枚举、13 个控制 API 声明 |
-| `pmw3901.h` | 光流驱动。安装参数、寄存器地址、`pmw3901_init()` / `pmw3901_read_motion()`（任务当前挂起） |
+| `pmw3901.h` | 光流驱动。安装参数、寄存器地址、运行时 `pmw_pix_to_m` 比例系数、`pmw3901_init()` / `pmw3901_read_motion()` |
 | `imu_protocol.h` | IMU 帧协议。帧头 `0x7E 0x23`、功能码 (欧拉角=0x26, 6轴切换=0x61, 校准=0x70)、环形缓冲 API、调试变量 |
 | `imu_uart.h` | IMU 串口收发。`imu_uart_start_rx()` 启动接收、`imu_uart_set_6axis()` / `imu_uart_calibrate_imu()` 发命令 |
 | `lcd_ili9488.h` | LCD 驱动。320×480、RGB565 颜色宏、`LCD_Init()` / `LCD_Clear()` / `LCD_Print()` |
@@ -37,6 +37,8 @@ GPIO: PD9=LCD_CS, PD10=LCD_RST, PD11=LCD_DC, PD12=LCD_LED（开机置高点亮�
 | `usart.h` | USART1/USART6 句柄和 `MX_USARTx_UART_Init()` |
 | `gpio.h` | GPIO 初始化声明 |
 | `main.h` | SPI CS 引脚宏 (PE2/PE3/PE4)、`Error_Handler()` |
+| `oflow.h` | 光流处理模块。配置参数 (偏移量/采样周期/squal 阈值)、全局状态变量 (oflow_x/y/vx/vy/squal_avg)、API: `OFlow_TaskLoop` / `OFlow_Reset` / `OFlow_GetPose` |
+| `oflow_calib.h` | 光流标定模块。位置模式参数 (3200脉冲/圈/200RPM)、`OFlowCalibResult_t` 结构体、API: `OFlowCalib_Height` / `OFlowCalib_Offset` / `OFlowCalib_GetPixToM` / `OFlowCalib_SetPixToM` |
 | `FreeRTOSConfig.h` | FreeRTOS 配置 (抢占式/1kHz tick/最大优先级 7/堆 64512B/静态+动态分配) |
 
 ### Core/Src/（源文件）
@@ -47,7 +49,9 @@ GPIO: PD9=LCD_CS, PD10=LCD_RST, PD11=LCD_DC, PD12=LCD_LED（开机置高点亮�
 | `freertos.c` | **所有业务逻辑**。8 个任务、全局变量 (里程计/IMU/目标速度)、`motor_emit()`、几何参数宏 |
 | `Emm_V5.c` | 电机协议实现。13 个函数均通过 `can_SendCmd()` 发 CAN 帧：速度控制 (`0xF6`)、位置控制 (`0xFD`)、使能 (`0xF3`)、停止 (`0xFE`)、同步等 |
 | `can.c` | CAN1 500kbps 初始化 + `can_SendCmd` (支持 >8 字节分包，ExtId=[addr<<8\|packNum]) + `CAN1_RX0_IRQHandler` |
-| `pmw3901.c` | 光流驱动实现。SPI1 Mode 3 读写寄存器、上电初始化、Motion Burst 12 字节读（任务当前挂起） |
+| `pmw3901.c` | 光流驱动实现。SPI1 Mode 3 读写寄存器、上电初始化、Motion Burst 12 字节读 |
+| `oflow.c` | 光流处理：100Hz Motion Burst 读 → squal 过滤 → 坐标映射 → 偏心补偿 → 体→场旋转 → 积分到 oflow_x/y |
+| `oflow_calib.c` | 光流标定实现：高度标定 (4 轮 Pos_Control 同步行走 + 光流累计 → pix_to_m)、偏心标定 (原地 360° → 反推 Lx/Ly) |
 | `imu_protocol.c` | IMU 协议解析。256B 环形缓冲 + 5 状态机解析帧、累加和校验、`IMU_FUNC_EULER` → 小端 float yaw × 57.2958 转度、**首帧 yaw 记为 0° 基准（软件零点）** |
 | `imu_uart.c` | USART1 单字节 `HAL_UART_Receive_IT` + 回调自动续接，每字节推入协议环形缓冲；命令发送组帧 (`0x7E 0x23` 头 + 累加和) |
 | `lcd_ili9488.c` | LCD 驱动实现。SPI2 写命令/数据、ILI9488 初始化序列、8×16 ASCII 字体 (43 字符)、`LCD_Print` 字符渲染、LCD 调试变量 |
@@ -64,7 +68,7 @@ GPIO: PD9=LCD_CS, PD10=LCD_RST, PD11=LCD_DC, PD12=LCD_LED（开机置高点亮�
 |------|------|--------|-----|------|------|
 | MotorTask | `StartTask02` | High | 512W | ~100ms | **当前停用**（空循环）。原功能：电机使能、逆运动学算 RPM、CAN 发速度命令 |
 | OdomTask | `StartOdomTask` | Normal | 512W | ~60ms | 轮询 4 电机 S_CPOS 位置 → 正运动学 → 世界系累加 `g_odom_x/y/theta` |
-| OptFlowTask | `StartOptFlowTask` | Normal | 512W | — | **挂起**（`vTaskSuspend(NULL)`，PMW3901 当前未用） |
+| OptFlowTask | `StartOptFlowTask` | Normal | 512W | 10ms | PMW3901 光流: `OFlow_TaskLoop()` — 100Hz Motion Burst 读 → 偏心补偿 → 场坐标积分 |
 | ImuTask | `StartImuTask` | Normal | 512W | 10ms | 发 6 轴切换命令 → 解析 IMU 帧 → 更新 `g_imu_yaw` (度) → 帧计数达标置 `g_imu_verified` |
 | DisplayTask | `StartDisplayTask` | BelowNormal | 512W | 200ms | LCD 刷新: IMU 状态/帧计数、YAW、里程计 X/Y/THETA |
 | ServoTask | `StartServoTask` | Normal | 512W | — | 空占位，舵机逻辑待填 |
@@ -73,17 +77,18 @@ GPIO: PD9=LCD_CS, PD10=LCD_RST, PD11=LCD_DC, PD12=LCD_LED（开机置高点亮�
 
 ## 里程计融合
 
-当前用编码器 + IMU 两个传感器（光流挂起未用）：
+当前用编码器 + IMU + 光流三个传感器：
 
 | 传感器 | 提供 | 强项 | 弱项 |
 |--------|------|------|------|
 | 电机编码器 (Emm_V5.0) | x, y | 直线位移准 | 打滑失效 |
 | IMU (USART1) | θ | 不受打滑/轴距误差影响 | 长期零漂（6 轴模式已抑制） |
-| 光流 (PMW3901) | — | — | 当前挂起未用 |
+| 光流 (PMW3901) | x, y (独立) | 不受轮打滑影响 | 受地面纹理/高度/光照影响 |
 
 策略：
 - **θ** → 直接读 IMU yaw（度→弧度）覆盖 `g_odom_theta`，不用编码器推 θ
 - **x, y** → 编码器正运动学算出体系位移，用 IMU θ 旋转到世界系累加
+- **光流 x, y** → 独立积分，可用于监测/融合（当前独立运行，尚未与编码器融合）
 
 正运动学（麦轮，右侧镜像安装取反）：
 
@@ -184,12 +189,133 @@ IMU 调试变量（[imu_protocol.c](Core/Src/imu_protocol.c)，Keil 在线看）
 - 代码位置：[lcd_ili9488.c](Core/Src/lcd_ili9488.c) `LCD_Init()` 中 `LCD_WriteCmd(0x36)` 后的 `LCD_WriteData(0x08)`。
 - 字体逐像素走坐标绘制，旋转后自动跟随，无需改动。
 
+## 光流模块 (PMW3901)
+
+### 硬件
+
+- 传感器: PMW3901MB-TXQT (PixArt 光流, SPI1 Mode 3, PE4 片选, 2.625Mbps)
+- 安装方向: X 朝车前, Y 朝车左 (传感器本体丝印)
+- 分辨率: 约 0.00213 m/pixel @ 10cm 高度 (`PMW_RESOLUTION_M = 0.002131946f`)
+
+### 坐标映射
+
+PMW3901 原始输出经安装方向 + 取反后映射到底盘体坐标：
+
+```
+dx_body (右) = -dy_raw × pix_to_m
+dy_body (前) = -dx_raw × pix_to_m
+```
+
+### 偏心补偿
+
+传感器不在底盘几何中心时，旋转会产生寄生位移：
+
+```
+dx_center = dx_sensor + dθ × offset_y
+dy_center = dy_sensor - dθ × offset_x
+```
+
+其中 `dθ` 由 IMU yaw 差分计算 (经低通滤波, alpha=0.3)，`offset_x/y` 为体坐标偏移 (右正/前正)。
+
+### 处理流程 (oflow.c — OFlow_TaskLoop)
+
+1. 启动延时 2500ms → `pmw3901_init()` 检查 ProductID/InvProductID
+2. 10ms 周期 (`vTaskDelayUntil`) 读 Motion Burst 12 字节
+3. 有效性判断: `observation == 0xBF && squal >= 0x19`，否则跳过
+4. 坐标映射 + 偏心补偿
+5. 体坐标→场坐标旋转 (用 `g_imu_yaw`)，累加到 `oflow_x/y`
+6. 速度估计: `oflow_vx/vy = dx/dt, dy/dt`
+
+### 全局状态变量
+
+| 变量 | 类型 | 单位 | 说明 |
+|------|------|------|------|
+| `oflow_x / oflow_y` | float | m | 光流场坐标 (右/前正) |
+| `oflow_vx / oflow_vy` | float | m/s | 光流速度估计 |
+| `oflow_squal_avg` | float | — | 平均表面质量 |
+| `oflow_valid_count` | uint32 | — | 有效采样计数 |
+| `oflow_invalid_count` | uint32 | — | 无效采样计数 |
+| `oflow_accum_dx_raw / dy_raw` | int32 | pixel | 调试用累计原始像素 |
+| `oflow_sensor_ok` | uint8 | — | 传感器状态 (1=正常) |
+
+### 标定 (oflow_calib.c)
+
+#### 高度标定 — `OFlowCalib_Height(axis, num_revolutions, result)`
+
+用电机位置模式 (16细分=3200脉冲/圈) 驱动 4 轮同步行走已知距离，同时累计光流像素：
+
+```
+pix_to_m = actual_distance_m / accum_pixels_on_motion_axis
+estimated_height_m = pix_to_m / PMW_RESOLUTION_M
+```
+
+参数: `axis=0` 前进 (Y 轴), `axis=1` 侧移 (X 轴), `num_revolutions` 转数 (如 5.0)。
+成功后自动更新全局 `pmw_pix_to_m`。
+
+#### 偏心标定 — `OFlowCalib_Offset(offset_x_out, offset_y_out)`
+
+原地转 360° (调用 `RotateTo(360°, ...)`)，光流理论位移应为零，不为零的差值反推偏移量：
+
+```
+Lx = oflow_y_360 / (2π)
+Ly = -oflow_x_360 / (2π)
+```
+
+标定结果填入 [oflow.h](Core/Inc/oflow.h) 的 `OFLOW_OFFSET_X_M / OFLOW_OFFSET_Y_M`。
+
+### 配置参数
+
+| 宏 (oflow.h) | 默认值 | 说明 |
+|---|---|---|
+| `OFLOW_OFFSET_X_M` | 0.000f | 传感器右偏量 m (偏心标定后填入) |
+| `OFLOW_OFFSET_Y_M` | 0.000f | 传感器前偏量 m |
+| `OFLOW_SAMPLE_MS` | 10 | 采样周期 (100Hz) |
+| `OFLOW_SQUAL_MIN` | 0x19 | 最低可信 squal |
+| `OFLOW_OMEGA_LPFA` | 0.3f | 角速度低通系数 (0~1, 小=更平滑) |
+| `OFLOW_INIT_DELAY_MS` | 2500 | 启动等待 ms |
+
+## 运动控制 (move.c)
+
+### 坐标约定
+
+- 体坐标: +X=右, +Y=前
+- 场坐标: +X=右, +Y=前 (Blu3 场)
+- 角度: CW 正 (顺时针为正)
+
+### wz 符号约定
+
+`Move_SetRobotVelocity(vx, vy, wz)` 的运动学将 wz 视为 **CW+**。右侧电机镜像安装后，正 wz 产生顺时针旋转。所有调用者直接传 CW+ 值，无需取反。
+
+### 关键参数 (move.h)
+
+| 宏 | 值 | 说明 |
+|---|---|---|
+| `MOVE_CMD_DELAY_MS` | 10 | 电机 CAN 帧间最小间隔 (Emm_V5 硬件约束) |
+| `MOVE_ACC_DEFAULT` | 30 | 默认加速度 |
+| `MOVE_YAW_SPEED_LIMIT` | 80.0f | 旋转速度上限 deg/s |
+| `MOVE_YAW_TURN_LIMIT` | 40.0f | 转弯角速度限制 deg/s |
+| `MOVE_LIN_SPEED_DEFAULT` | 0.3f | 默认直线速度 m/s |
+| `MOVE_ROTATE_KP` | 0.03f | 角度 P 控制器增益 |
+
+### 运动函数
+
+| 函数 | 功能 |
+|------|------|
+| `Move_SetRobotVelocity(vx, vy, wz)` | 底层: 体坐标速度 → 麦轮逆运动学 → 4 电机 CAN |
+| `Move_SetFieldVelocity(vx_f, vy_f, wz)` | 场坐标速度 → 旋转到体坐标 → 调 SetRobotVelocity |
+| `MoveToTimed(dist, angle, timeout_ms)` | 沿指定方向直线移动 (开环时间) |
+| `MoveToAccurateTimed(dist, angle, timeout_ms)` | 直线移动 (PID 闭环) |
+| `MoveToAxisLockTimed(target_x, target_y, timeout_ms)` | 轴锁定直线移动 (防麦轮漂移) |
+| `RotateTo(target_deg, timeout_ms)` | 原地旋转到目标角度 |
+| `MoveArc(cx, cy, r, start_deg, end_deg, timeout_ms)` | 圆弧运动 |
+
 ## 未完成
 
 - MotorTask 重新启用（当前为空循环停用）
 - CommTask: 上位机通讯 (USART6 预留)
 - 位置环 / 路径跟随
-- 光流 (PMW3901) 重新启用与安装高度校准（当前挂起）
+- 光流与编码器里程计融合（当前独立运行）
+- 光流高度标定实测 + 偏心标定 (OFLOW_OFFSET_X/Y_M 待填入)
 - ServoTask / LightTask 业务逻辑
 - 触摸屏驱动 (XPT2046, 引脚已预留 PC9~PC12/PG8, 未写驱动)
 
