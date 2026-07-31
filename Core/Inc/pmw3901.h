@@ -22,9 +22,9 @@
 #define PMW_CS_HIGH()   HAL_GPIO_WritePin(SPI1_CS3_GPIO_Port, SPI1_CS3_Pin, GPIO_PIN_SET)
 
 /* 安装参数 — 默认值 (标定后由 oflow_calib 更新运行时变量) */
-#define PMW_HEIGHT_DEFAULT_M        0.10f           /* 镜头距地面 ~10cm (参考, 待标定) */
-#define PMW_RESOLUTION_M            0.002131946f    /* 1m 高度下 1 像素 = 0.002131946 m (datasheet) */
-#define PMW_PIX_TO_M_DEFAULT        (PMW_RESOLUTION_M * PMW_HEIGHT_DEFAULT_M)
+#define PMW_HEIGHT_DEFAULT_M        0.08f           /* 镜头距地面 8cm */
+#define PMW_RESOLUTION_M            0.002131946f    /* 1m 高度下 1 count = 0.002132 m (datasheet) */
+#define PMW_PIX_TO_M_DEFAULT        0.000171f       /* 理论值: 0.08m × 0.002132 (LED开启后重标验证) */
 
 /* 运行时变量 (标定模块可修改, 其他模块只读) */
 extern float pmw_pix_to_m;     /* 当前生效的 像素→米 比例系数 */
@@ -90,8 +90,40 @@ bool pmw3901_init(void);
  */
 void pmw3901_read_motion(int16_t *dx, int16_t *dy, uint8_t *squal, uint8_t *obs);
 
+/**
+ * @brief  控制 PMW3901 内部 IR LED
+ * @param  on  1=开启, 0=关闭
+ *         初始化时自动开启; 若 shutter 异常高可尝试重新调用
+ */
+void pmw3901_set_led(uint8_t on);
+extern volatile uint8_t pmw_led_readback;  /* 回读 bank0x14 reg0x6F, 应=0x1C */
+
 /* Init debug variables (Keil Watch) */
 extern volatile uint8_t pmw_init_step;     /* 0=not run, 1=ProdID, 2=InvProdID, 3=OptRegs, 4=Obs, 0xFF=OK */
 extern volatile uint8_t pmw_debug_reg_val; /* actual register value read at failing step */
+extern volatile uint8_t pmw_diag_regs[4];  /* [0]=Product_ID [1]=Rev_ID [2]=Inv_Product_ID [3]=Observation */
+
+/* Motion Burst 诊断 (每次 read_motion 更新, Keil Watch 查看)
+ * 参考 pmw3901mb 库: BYTE[7]=RawSum BYTE[8]=RawMax BYTE[9]=RawMin
+ *                    BYTE[10..11]=Shutter(13bit, 大=暗/低帧率)
+ * 正常光照: shutter < 200, raw_max 约 150~220, raw_min 约 30~80
+ * shutter > 1000 = 严重曝光不足, 内部帧率极低, 运动追踪会大量丢失 */
+extern volatile uint8_t  pmw_burst_raw[12];  /* 完整 12 字节原始数据 */
+extern volatile uint16_t pmw_last_shutter;   /* 13-bit: ((raw[10]&0x1F)<<8)|raw[11] */
+extern volatile uint8_t  pmw_last_raw_max;   /* BYTE[8] 图像最亮像素 */
+extern volatile uint8_t  pmw_last_raw_min;   /* BYTE[9] 图像最暗像素 */
+extern volatile uint8_t  pmw_last_raw_sum;   /* BYTE[7] 图像平均亮度 */
+extern volatile uint8_t  pmw_last_motion;    /* BYTE[0] bit7=有运动 */
+
+/* Shutter 交叉诊断 (排查 shutter 恒定不变问题)
+ * pmw3901_read_shutter_regs(): 直接读 reg 0x0B/0x0C, 与 burst 解析对比
+ * pmw_shutter_same_cnt: 连续 N 帧 burst shutter 不变计数
+ *   正常: 光照变化时 shutter 应调整, same_cnt 不应持续增长
+ *   异常: same_cnt > 1000 (10s) → 传感器可能未产生帧 */
+uint16_t pmw3901_read_shutter_regs(void);
+void     pmw3901_update_frame_health(void);
+extern volatile uint16_t pmw_shutter_direct;    /* 直接读寄存器值 */
+extern volatile uint16_t pmw_shutter_prev;      /* 上一次 burst 值 */
+extern volatile uint16_t pmw_shutter_same_cnt;  /* 连续不变计数 */
 
 #endif /* __PMW3901_H */

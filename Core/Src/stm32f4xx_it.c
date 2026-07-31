@@ -25,6 +25,7 @@
 #include "can.h"
 #include "cmsis_os.h"
 #include "uart_protocol.h"
+#include "move.h"
 #include <string.h>
 extern osMessageQId DataQueueHandle;
 extern osMessageQId NavQueueHandle;
@@ -173,6 +174,44 @@ static inline void dispatch_frame(uint8_t type, const uint8_t *payload, uint8_t 
         portYIELD_FROM_ISR(h);
         g_rx_nav_count++;
     }
+    else if (type == TYPE_CMD_CALIB_HEIGHT && len == 8) {
+        NavPacket_t nav; nav.cmd = NAV_CMD_CALIB_HEIGHT;
+        memcpy(&nav.f[0], payload, 4);      /* axis (0=Y, 1=X) */
+        memcpy(&nav.f[1], payload + 4, 4);  /* num_revolutions */
+        BaseType_t h = pdFALSE;
+        xQueueSendFromISR(NavQueueHandle, &nav, &h);
+        portYIELD_FROM_ISR(h);
+        g_rx_nav_count++;
+    }
+    else if (type == TYPE_CMD_CALIB_OFFSET && len == 4) {
+        NavPacket_t nav; nav.cmd = NAV_CMD_CALIB_OFFSET;
+        BaseType_t h = pdFALSE;
+        xQueueSendFromISR(NavQueueHandle, &nav, &h);
+        portYIELD_FROM_ISR(h);
+        g_rx_nav_count++;
+    }
+    // --- Pure Pursuit 路径跟踪 ---
+    else if (type == TYPE_CMD_PATH_BEGIN && len == 5) {
+        float speed; memcpy(&speed, payload, 4);
+        uint8_t count = payload[4];
+        Move_PathBegin(count, speed);   /* 仅写全局缓冲, 不入队 */
+        g_rx_nav_count++;
+    }
+    else if (type == TYPE_CMD_PATH_POINT && len == 12) {
+        float x, y, hd;
+        memcpy(&x,  payload,     4);
+        memcpy(&y,  payload + 4, 4);
+        memcpy(&hd, payload + 8, 4);
+        Move_PathAddPoint(x, y, hd);    /* 追加到全局缓冲, 不入队 */
+        g_rx_nav_count++;
+    }
+    else if (type == TYPE_CMD_PATH_EXEC) {
+        NavPacket_t nav; nav.cmd = NAV_CMD_PATH;
+        BaseType_t h = pdFALSE;
+        xQueueSendFromISR(NavQueueHandle, &nav, &h);
+        portYIELD_FROM_ISR(h);
+        g_rx_nav_count++;
+    }
 }
 /* USER CODE END 0 */
 
@@ -293,9 +332,24 @@ void CAN1_RX0_IRQHandler(void)
   /* USER CODE BEGIN CAN1_RX0_IRQn 0 */
 
   uint8_t i = 0;
-  if(HAL_CAN_GetRxMessage(&hcan1, CAN_RX_FIFO0, (CAN_RxHeaderTypeDef *)(&can.CAN_RxMsg), (uint8_t *)(&can.rxData)) == HAL_OK)
+  /* Drain ALL pending messages from FIFO to prevent frame loss.
+   * Old code only read 1 frame per ISR; remaining frames get stuck
+   * because the FIFO pending interrupt doesn't re-fire.
+   *
+   * Snapshot fix: 每次 GetRxMessage 后保存完整帧�?? rxSnap/rxSnapData.
+   * move.c / OdomTask 从快照读�??, 避免共享 rxData 被后续帧覆盖
+   * 导致部分读取 (符号字节被篡�?? �?? 编码器符号翻�?? �?? 里程计爆�??).
+   * drain循环中多次覆盖快�??, �??终保留最后一�?? �?? 这是�??佳可用帧. */
+  while(HAL_CAN_GetRxFifoFillLevel(&hcan1, CAN_RX_FIFO0) > 0)
   {
-    for(i=can.CAN_RxMsg.DLC; i < 8; i++) { can.rxData[i] = 0; } can.rxFrameFlag = true;
+    if(HAL_CAN_GetRxMessage(&hcan1, CAN_RX_FIFO0, (CAN_RxHeaderTypeDef *)(&can.CAN_RxMsg), (uint8_t *)(&can.rxData)) == HAL_OK)
+    {
+      for(i=can.CAN_RxMsg.DLC; i < 8; i++) { can.rxData[i] = 0; }
+      /* 保存快照: 完整帧头 + 数据副本 */
+      can.rxSnap = can.CAN_RxMsg;
+      for(i=0; i<8; i++) { can.rxSnapData[i] = can.rxData[i]; }
+      can.rxFrameFlag = true;
+    }
   }
 
   /* USER CODE END CAN1_RX0_IRQn 0 */
@@ -361,11 +415,11 @@ void USART6_IRQHandler(void)
   if (__HAL_UART_GET_FLAG(&huart6, UART_FLAG_IDLE) != RESET) {
     __HAL_UART_CLEAR_IDLEFLAG(&huart6);
 
-    // 计算DMA当前写位�??
+    // 计算DMA当前写位�?????
     uint16_t write_pos = RX_BUF_SIZE
         - __HAL_DMA_GET_COUNTER(&hdma_usart6_rx);
 
-    // 处理新字�??
+    // 处理新字�?????
     if (write_pos != dma_read_pos) {
       if (write_pos > dma_read_pos) {
         for (uint16_t i = dma_read_pos; i < write_pos; i++) {
@@ -376,7 +430,7 @@ void USART6_IRQHandler(void)
           }
         }
       } else {
-        // 缓冲区回�?? (CIRCULAR模式或NORMAL重启�??)
+        // 缓冲区回�????? (CIRCULAR模式或NORMAL重启�?????)
         for (uint16_t i = dma_read_pos; i < RX_BUF_SIZE; i++) {
           uint8_t out_type, out_payload[64], out_len;
           if (UartParser_FeedByte(&uart6_parser, RxDMA_Buf[i],
@@ -395,7 +449,7 @@ void USART6_IRQHandler(void)
       dma_read_pos = write_pos;
     }
 
-    // DMA NORMAL模式: 缓冲区满后DMA停止, �??要重�??
+    // DMA NORMAL模式: 缓冲区满后DMA停止, �?????要重�?????
     if (huart6.RxState == HAL_UART_STATE_READY) {
       dma_read_pos = 0;
       HAL_UART_Receive_DMA(&huart6, RxDMA_Buf, RX_BUF_SIZE);

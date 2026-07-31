@@ -441,6 +441,21 @@
               <FilePath>../Core/Src/light.c</FilePath>
             </File>
             <File>
+              <FileName>move.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\move.c</FilePath>
+            </File>
+            <File>
+              <FileName>goto_pos.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\goto_pos.c</FilePath>
+            </File>
+            <File>
+              <FileName>xpt2046.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\xpt2046.c</FilePath>
+            </File>
+            <File>
               <FileName>main.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/main.c</FilePath>
@@ -744,16 +759,6 @@
               <FileName>stm32f4xx_hal_timebase_tim.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/stm32f4xx_hal_timebase_tim.c</FilePath>
-            </File>
-            <File>
-              <FileName>move.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\move.c</FilePath>
-            </File>
-            <File>
-              <FileName>goto_pos.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\goto_pos.c</FilePath>
             </File>
           </Files>
         </Group>

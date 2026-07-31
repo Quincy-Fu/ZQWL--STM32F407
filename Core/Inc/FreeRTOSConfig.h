@@ -87,7 +87,7 @@ to exclude the API function. */
 #define INCLUDE_vTaskDelete                  1
 #define INCLUDE_vTaskCleanUpResources        0
 #define INCLUDE_vTaskSuspend                 1
-#define INCLUDE_vTaskDelayUntil              1
+#define INCLUDE_vTaskDelayUntil              0
 #define INCLUDE_vTaskDelay                   1
 #define INCLUDE_xTaskGetSchedulerState       1
 
@@ -134,6 +134,13 @@ standard names. */
 
 /* USER CODE BEGIN Defines */
 /* Section where parameter definitions can be added (for instance, to override default ones in FreeRTOS.h) */
+
+/* CubeMX 每次重生成会把上�? INCLUDE_vTaskDelayUntil 重置�? 0,
+ * 在此强制覆盖�? 1 (oflow.c �? vTaskDelayUntil 依赖).
+ * USER CODE 区不�? CubeMX 重生成影�?. */
+#undef  INCLUDE_vTaskDelayUntil
+#define INCLUDE_vTaskDelayUntil  1
+
 /* USER CODE END Defines */
 
 #endif /* FREERTOS_CONFIG_H */

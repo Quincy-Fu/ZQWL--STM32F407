@@ -34,6 +34,8 @@
 #include "move.h"
 #include "goto_pos.h"
 #include "oflow.h"
+#include "oflow_calib.h"
+#include "xpt2046.h"
 #include "light.h"
 #include "tim.h"
 #include <math.h>
@@ -108,6 +110,7 @@ volatile float g_odom_theta = 0.0f;   // heading (rad), CCW positive
 // Unit: degrees (imu_protocol.c converts raw rad -> deg), CCW positive
 // Zero at power-on heading
 volatile float g_imu_yaw = 0.0f;
+volatile uint32_t g_imu_last_tick = 0;   /* xTaskGetTickCount of last yaw update */
 
 // IMU status: 1 = verified OK
 volatile uint8_t g_imu_verified = 0;
@@ -127,6 +130,26 @@ osMessageQId NavQueueHandle;
 
 // USART6 mutex: protects concurrent HAL_UART_Transmit between CommTask and NavTask
 osMutexId Uart6MutexHandle;
+
+// �???�??? CubeMX-managed handles that we also reference in USER CODE �???�???
+// These MUST be here (not in CubeMX area) to survive code regeneration.
+osMessageQId DataQueueHandle;
+osThreadId   CommTaskHandle;
+
+// �???�??? Extern declarations for ISR-set global variables �???�???
+// Defined in stm32f4xx_it.c dispatch_frame(), consumed by ServoTask/LightTask.
+// MUST be here (not in CubeMX area) to survive code regeneration.
+extern volatile uint8_t  g_light_pending_id;
+extern volatile uint8_t  g_light_pending_on;
+extern volatile uint8_t  g_light_pending;
+extern volatile uint8_t  g_arm_state;
+
+// 偏心标定诊断 (定义�? oflow_calib.c)
+extern volatile int32_t  calib_dbg_dx;
+extern volatile int32_t  calib_dbg_dy;
+extern volatile uint8_t  calib_dbg_squal;
+extern volatile uint8_t  calib_dbg_obs;
+extern volatile float    calib_dbg_total_deg;
 /* USER CODE END Variables */
 osThreadId defaultTaskHandle;
 osThreadId MotorTaskHandle;
@@ -137,16 +160,6 @@ osThreadId DisplayTaskHandle;
 osThreadId ServoTaskHandle;
 osThreadId LightTaskHandle;
 osThreadId PosMotorTaskHandle;
-osThreadId CommTaskHandle;
-osMessageQId DataQueueHandle;
-
-// Light control: set by ISR dispatch, consumed by LightTask
-extern volatile uint8_t  g_light_pending_id;
-extern volatile uint8_t  g_light_pending_on;
-extern volatile uint8_t  g_light_pending;
-
-// ARM servo state control: set by ISR dispatch, consumed by ServoTask
-extern volatile uint8_t g_arm_state;  // 1-8 = predefined pose states
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
@@ -162,6 +175,9 @@ void SendPoseToPC(float x, float y, float theta);
 // NavTask / navigation command execution (Stage 3)
 void StartNavTask(void const * argument);
 void SendNavResultToPC(uint8_t type, uint8_t status);
+void SendPathDebugToPC(float mx, float my, int16_t closest, int16_t la,
+                       float vx_f, float vy_f, float wz, float target_yaw,
+                       uint16_t loop_ms, uint8_t enc_ok);  /* [调试用,定位后删除] */
 
 /* USER CODE END FunctionPrototypes */
 
@@ -397,32 +413,44 @@ void StartOdomTask(void const * argument)
 
   for(;;) {
     // Stage 3: skip CAN read when Move module is controlling motors.
-    // Reset baseline so OdomTask resumes cleanly without double-counting
-    // the encoder movement that Move already integrated.
+    // Reset baseline AND cur_motor so OdomTask resumes cleanly without
+    // double-counting the encoder movement that Move already integrated.
+    // cur_motor=0 forces a fresh 4-motor read cycle: all cur_pos[] will be
+    // overwritten with post-GOTO values BEFORE last_pos is set, preventing
+    // stale pre-GOTO values from creating huge false deltas.
     if (g_move_active) {
       has_last = false;
+      cur_motor = 0;
       osDelay(20);
       continue;
     }
 
     // 1. Send S_CPOS read command to current motor
+    //    Pre-init cur_pos to last_pos (same fix as move.c move_read_all_encoders):
+    //    if read times out, delta=0 instead of retaining a stale pre-GOTO value.
+    //    Clear stale rxFrameFlag (same fix as move.c move_read_encoder).
+    cur_pos[cur_motor] = last_pos[cur_motor];
+    can.rxFrameFlag = false;
     Emm_V5_Read_Sys_Params(addr_map[cur_motor], S_CPOS);
 
     // 2. Wait for response (20ms timeout)
     //    S_CPOS reply (DLC=7): [0]=0x36, [1]=sign, [2..5]=big-endian pos, [6]=checksum
+    //    Read from ISR snapshot to avoid shared buffer race (see stm32f4xx_it.c).
     uint32_t t_start = HAL_GetTick();
     while (HAL_GetTick() - t_start < 20) {
       if (can.rxFrameFlag) {
-        uint8_t rx_addr = (uint8_t)(can.CAN_RxMsg.ExtId >> 8);
+        uint8_t rx_addr = (uint8_t)(can.rxSnap.ExtId >> 8);
+        uint8_t sd[8];
+        for (uint8_t k = 0; k < 8; k++) sd[k] = can.rxSnapData[k];
         if (rx_addr == addr_map[cur_motor] &&
-            can.rxData[0] == 0x36 &&
-            can.CAN_RxMsg.DLC == 7) {
-          uint32_t pos_u = ((uint32_t)can.rxData[2] << 24) |
-                           ((uint32_t)can.rxData[3] << 16) |
-                           ((uint32_t)can.rxData[4] << 8)  |
-                           ((uint32_t)can.rxData[5] << 0);
+            sd[0] == 0x36 &&
+            can.rxSnap.DLC == 7) {
+          uint32_t pos_u = ((uint32_t)sd[2] << 24) |
+                           ((uint32_t)sd[3] << 16) |
+                           ((uint32_t)sd[4] << 8)  |
+                           ((uint32_t)sd[5] << 0);
           int32_t pos = (int32_t)pos_u;
-          if (can.rxData[1]) pos = -pos;
+          if (sd[1]) pos = -pos;   /* sign-magnitude */
           cur_pos[cur_motor] = pos;
           can.rxFrameFlag = false;
           break;
@@ -438,31 +466,50 @@ void StartOdomTask(void const * argument)
     // 4. All 4 motors read -> forward kinematics + world-frame integration
     if (cur_motor == 0) {
       if (has_last) {
-        // Wheel linear displacement (right-side mirror: negate)
-        float d_FL = (float)(cur_pos[0] - last_pos[0]) * ENC_TO_M;
-        float d_FR = -(float)(cur_pos[1] - last_pos[1]) * ENC_TO_M;
-        float d_RL = (float)(cur_pos[2] - last_pos[2]) * ENC_TO_M;
-        float d_RR = -(float)(cur_pos[3] - last_pos[3]) * ENC_TO_M;
+        // Delta sanity check (same as move.c MOVE_ENC_MAX_DELTA=50000):
+        // normal max ~88RPM×65536/60×0.12s ≈ 6900 counts per 120ms cycle.
+        // 50000 = 7x margin. Exceeding it means a read failed in the previous
+        // cycle and last_pos still holds a stale pre-GOTO value → skip
+        // integration, just update baseline so next cycle starts fresh.
+        int32_t delta[4];
+        bool delta_ok = true;
+        for (uint8_t i = 0; i < 4; i++) {
+          delta[i] = (int32_t)((uint32_t)cur_pos[i] - (uint32_t)last_pos[i]);
+          int32_t ad = delta[i];
+          if (ad < 0) ad = -ad;
+          if (ad > 50000) { delta_ok = false; break; }
+        }
 
-        // Mecanum forward kinematics -> body-frame displacement
-        // (must match move.c move_update_odom exactly)
-        float dx_body = (d_FL - d_FR - d_RL + d_RR) * 0.25f;  // right
-        float dy_body = (d_FL + d_FR + d_RL + d_RR) * 0.25f;  // forward
+        if (delta_ok) {
+          // Wheel linear displacement (right-side mirror: negate)
+          // uint32 subtraction handles 32-bit wraparound correctly via 2's complement
+          float d_FL = (float)delta[0] * ENC_TO_M;
+          float d_FR = -(float)delta[1] * ENC_TO_M;
+          float d_RL = (float)delta[2] * ENC_TO_M;
+          float d_RR = -(float)delta[3] * ENC_TO_M;
 
-        // Heading from IMU (g_imu_yaw in degrees -> radians for trig)
-        float theta = g_imu_yaw * 0.01745329f;
+          // Mecanum forward kinematics -> body-frame displacement
+          // (must match move.c move_update_odom exactly)
+          float dx_body = (d_FL - d_FR - d_RL + d_RR) * 0.25f;  // right
+          float dy_body = (d_FL + d_FR + d_RL + d_RR) * 0.25f;  // forward
 
-        // Rotate body -> world frame (X=right, Y=forward, theta=CCW)
-        // Same rotation as move.c move_update_odom
-        float ct = cosf(theta);
-        float st = sinf(theta);
-        __disable_irq();
-        g_odom_x     += dx_body * ct + dy_body * st;   // right
-        g_odom_y     += -dx_body * st + dy_body * ct;  // forward
-        g_odom_theta  = theta;
-        __enable_irq();
+          // Heading from IMU (g_imu_yaw in degrees -> radians for trig)
+          float theta = g_imu_yaw * 0.01745329f;
+
+          // Rotate body -> world frame (X=right, Y=forward, theta=CCW)
+          // Same rotation as move.c move_update_odom
+          float ct = cosf(theta);
+          float st = sinf(theta);
+          __disable_irq();
+          g_odom_x     += dx_body * ct + dy_body * st;   // right
+          g_odom_y     += -dx_body * st + dy_body * ct;  // forward
+          g_odom_theta  = theta;
+          __enable_irq();
+        }
       }
 
+      // Always update baseline (even if integration was skipped):
+      // cur_pos was pre-init'd to last_pos on failed reads, so this is safe.
       last_pos[0] = cur_pos[0];
       last_pos[1] = cur_pos[1];
       last_pos[2] = cur_pos[2];
@@ -487,7 +534,7 @@ void StartOptFlowTask(void const * argument)
 {
   /* USER CODE BEGIN StartOptFlowTask */
 
-  // PMW3901 光流处理: 初始化传感器 → 10ms 采样 → 偏心补偿 → 独立里程计
+  // PMW3901 光流处理: 初始化传感器 �???? 10ms 采样 �???? 偏心补偿 �???? 独立里程�????
   OFlow_TaskLoop();
 
   /* USER CODE END StartOptFlowTask */
@@ -516,19 +563,35 @@ void StartImuTask(void const * argument)
   imu_uart_set_6axis();
   osDelay(100);  // wait for internal mode switch
 
-  // Per-boot 7s gyro/accel calibration REMOVED (wasted ~7s; the IMU keeps its
-  // calibration in flash). imu_uart_calibrate_imu() still exists in imu_uart.c
-  // for a manual re-calibration if ever needed.
+  /* 临时: 重新校准陀螺仪零偏 (保持静止, 约7秒)
+   * 校准已完成, 注释掉避免每次开机等7秒 */
+  /* imu_uart_calibrate_imu(); */
+  /* osDelay(7000); */
 
+  /* �???�??? �???阶低通滤�???: 平滑IMU噪声, 防止角度环振�??? �???�???
+   * IMU输出25Hz, alpha=0.5 �??? 时间常数�???58ms
+   * 0.2时旋转中滞后0.54°(3.4°/s), 0.5时滞�???0.14°
+   * 噪声由RotateToTimed 3帧settle兜底 */
+  #define IMU_YAW_LPF_ALPHA  0.5f
   float yaw;
+  float yaw_filtered = 0.0f;
+  uint8_t yaw_filter_init = 0;
   for(;;) {
     // Parse complete frames from ring buffer
     imu_protocol_process();
 
     // Get latest yaw -> global (unit: degrees, from imu_protocol.c)
     if (imu_protocol_get_yaw(&yaw)) {
+      /* 低�?�滤�???: filtered = filtered + alpha * (raw - filtered) */
+      if (!yaw_filter_init) {
+        yaw_filtered = yaw;       /* 首次直接赋�??, 避免启动瞬变 */
+        yaw_filter_init = 1;
+      } else {
+        yaw_filtered += IMU_YAW_LPF_ALPHA * (yaw - yaw_filtered);
+      }
       __disable_irq();
-      g_imu_yaw = yaw;
+      g_imu_yaw = yaw_filtered;
+      g_imu_last_tick = xTaskGetTickCount();
       __enable_irq();
     }
 
@@ -554,55 +617,326 @@ void StartDisplayTask(void const * argument)
 {
   /* USER CODE BEGIN StartDisplayTask */
   extern volatile uint32_t g_rx_nav_count;
-  LCD_Init();
+  // Optical flow globals from oflow.h
+  extern volatile float oflow_x, oflow_y, oflow_vx, oflow_vy;
+  extern volatile float oflow_squal_avg;
+  extern volatile uint32_t oflow_valid_count, oflow_invalid_count;
+  extern volatile uint8_t oflow_sensor_ok;
 
+  // Encoder diagnostics from move.c
+  extern volatile int32_t dbg_enc_raw[4];
+  extern volatile int32_t dbg_enc_delta[4];
+  extern volatile int32_t dbg_enc_ok;
+  extern volatile uint8_t dbg_enc_fail;
+  extern volatile uint32_t dbg_enc_bad_delta;
+  extern volatile int16_t dbg_cmd_rpm[4];
+
+  LCD_Init();
   LCD_Clear(LCD_BLACK);
 
-  char buf[40];
+  // Initialize XPT2046 touch screen
+  uint8_t touch_ok = XPT2046_Init();
+
+  // Touch button state (debounced)
+  uint8_t btn_sync_held = 0;  // SYNC 0,0 button pressed flag
+  uint8_t btn_goto_held = 0;  // GOTO 0,0.3 button pressed flag
+
+  // Settings page state machine
+  uint8_t  page_mode = 0;   // 0=main, 1=settings page
+  int      set_x_cm  = 0;   // X in cm (step 5)
+  int      set_y_cm  = 0;   // Y in cm (step 5)
+  uint8_t  set_yaw_i = 0;   // yaw index 0-7 (each = 45 deg)
+  uint8_t  prev_touched = 0; // edge detect: was touched last cycle?
+
+  char buf[42];
   for(;;)
   {
-    float ox, oy, ot, iy;
-    float mx, my, myaw;
+    // �????�???? snapshot all shared variables �????�????
+    float ox, oy, iy;
     uint8_t imu_ok, mact;
-    uint32_t fc, navcnt;
+    float ofx, ofy, ofvx, ofvy, ofsq;
+    uint32_t ofok, ofbad;
+    uint8_t ofsen;
+    uint8_t tg, homed;
+    uint32_t pcnt;
+
     __disable_irq();
     ox = g_odom_x;
     oy = g_odom_y;
-    ot = g_odom_theta;
     iy = g_imu_yaw;
     imu_ok = g_imu_verified;
-    fc = imu_frame_count;
     mact = g_move_active;
-    navcnt = g_rx_nav_count;
-    mx = move_x;
-    my = move_y;
-    myaw = move_yaw;
+    ofx = oflow_x;
+    ofy = oflow_y;
+    ofvx = oflow_vx;
+    ofvy = oflow_vy;
+    ofsq = oflow_squal_avg;
+    ofok = oflow_valid_count;
+    ofbad = oflow_invalid_count;
+    ofsen = oflow_sensor_ok;
+    tg = g_target_gear;
+    homed = g_pos_homed;
+    pcnt = g_pos_cmd_count;
+    /* encoder diag snapshot */
+    int32_t ed_raw[4], ed_delta[4], ed_ok;
+    uint8_t ed_fail;
+    uint32_t ed_bad;
+    int16_t ed_rpm[4];
+    for (int _i = 0; _i < 4; _i++) { ed_raw[_i] = dbg_enc_raw[_i]; ed_delta[_i] = dbg_enc_delta[_i]; ed_rpm[_i] = dbg_cmd_rpm[_i]; }
+    ed_ok = dbg_enc_ok;
+    ed_fail = dbg_enc_fail;
+    ed_bad = dbg_enc_bad_delta;
     __enable_irq();
 
-    LCD_Print(10, 10, "-- ZQWL ODOMETRY --", LCD_CYAN, LCD_BLACK);
+    // Normalize yaw to 0-360 range for display
+    float yaw_disp = iy;
+    while (yaw_disp < 0.0f) yaw_disp += 360.0f;
+    while (yaw_disp >= 360.0f) yaw_disp -= 360.0f;
 
-    if (imu_ok) {
-      snprintf(buf, sizeof(buf), "IMU: OK  FC:%lu", (unsigned long)fc);
-      LCD_Print(10, 40, buf, LCD_GREEN, LCD_BLACK);
-    } else {
-      snprintf(buf, sizeof(buf), "IMU: WAIT  FC:%lu", (unsigned long)fc);
-      LCD_Print(10, 40, buf, LCD_RED, LCD_BLACK);
+    // ════════════════════════════════════════
+    //  Section 1: ODOMETRY  (y = 0 ~ 80)
+    // ════════════════════════════════════════
+    LCD_Print(4, 0, "-- ODOMETRY --", LCD_CYAN, LCD_BLACK);
+
+    snprintf(buf, sizeof(buf), "X:%+.3f  Y:%+.3f M",
+             (double)ox, (double)oy);
+    LCD_Print(4, 20, buf, LCD_WHITE, LCD_BLACK);
+
+    snprintf(buf, sizeof(buf), "YAW: %6.1f DEG", (double)yaw_disp);
+    LCD_Print(4, 40, buf, LCD_YELLOW, LCD_BLACK);
+
+    snprintf(buf, sizeof(buf), "IMU:%s  NAV:%s",
+             imu_ok ? "OK" : "WAIT", mact ? "BUSY" : "IDLE");
+    LCD_Print(4, 60, buf, imu_ok ? LCD_GREEN : LCD_RED, LCD_BLACK);
+
+    // separator
+    LCD_Print(4, 82, "------------------------------", LCD_GRAY, LCD_BLACK);
+
+    // ════════════════════════════════════════
+    //  Section 2: OPTICAL FLOW  (y = 100 ~ 200)
+    // ════════════════════════════════════════
+    LCD_Print(4, 100, "-- OPTICAL FLOW --", LCD_GREEN, LCD_BLACK);
+
+    snprintf(buf, sizeof(buf), "FX:%+.3f FY:%+.3f M",
+             (double)ofx, (double)ofy);
+    LCD_Print(4, 120, buf, LCD_WHITE, LCD_BLACK);
+
+    snprintf(buf, sizeof(buf), "VX:%+.3f VY:%+.3f",
+             (double)ofvx, (double)ofvy);
+    LCD_Print(4, 140, buf, LCD_WHITE, LCD_BLACK);
+
+    snprintf(buf, sizeof(buf), "SQ:%.0f V:%lu B:%lu",
+             (double)ofsq, (unsigned long)ofok, (unsigned long)ofbad);
+    LCD_Print(4, 160, buf, LCD_GRAY, LCD_BLACK);
+
+    LCD_Print(4, 180, ofsen ? "SENSOR: OK" : "SENSOR: NO",
+              ofsen ? LCD_GREEN : LCD_RED, LCD_BLACK);
+
+    // separator
+    LCD_Print(4, 202, "------------------------------", LCD_GRAY, LCD_BLACK);
+
+    // ════════════════════════════════════════
+    //  Section 3: TURNTABLE  (y = 220 ~ 300)
+    // ════════════════════════════════════════
+    LCD_Print(4, 220, "-- TURNTABLE --", LCD_MAGENTA, LCD_BLACK);
+
+    snprintf(buf, sizeof(buf), "SLOT: %d (%3d DEG)", (int)tg, (int)tg * 72);
+    LCD_Print(4, 240, buf, LCD_WHITE, LCD_BLACK);
+
+    snprintf(buf, sizeof(buf), "HOME:%s  CMD:%lu",
+             homed ? "OK" : "WAIT", (unsigned long)pcnt);
+    LCD_Print(4, 260, buf, homed ? LCD_GREEN : LCD_RED, LCD_BLACK);
+
+    // Show all 5 slots, highlight current target
+    {
+      char slots[32];
+      int pos = 0;
+      for (int i = 0; i < 5; i++) {
+        if (i == (int)tg) {
+          pos += snprintf(slots + pos, sizeof(slots) - pos, "[%d]", i);
+        } else {
+          pos += snprintf(slots + pos, sizeof(slots) - pos, " %d ", i);
+        }
+      }
+      slots[pos] = '\0';
+      LCD_Print(4, 280, slots, LCD_CYAN, LCD_BLACK);
     }
-    snprintf(buf, sizeof(buf), "YAW: %.2f DEG", (double)iy);
-    LCD_Print(10, 60, buf, LCD_YELLOW, LCD_BLACK);
 
-    LCD_Print(10, 90, "ODOM:", LCD_WHITE, LCD_BLACK);
-    snprintf(buf, sizeof(buf), "X:%.3f Y:%.3f", (double)ox, (double)oy);
-    LCD_Print(10, 110, buf, LCD_WHITE, LCD_BLACK);
-    snprintf(buf, sizeof(buf), "THETA: %.3f RAD", (double)ot);
-    LCD_Print(10, 130, buf, LCD_WHITE, LCD_BLACK);
+    // separator
+    LCD_Print(4, 302, "------------------------------", LCD_GRAY, LCD_BLACK);
 
-    snprintf(buf, sizeof(buf), "NAV:%s N:%lu",
-             mact ? "ACT" : "IDL", (unsigned long)navcnt);
-    LCD_Print(10, 160, buf, LCD_MAGENTA, LCD_BLACK);
-    snprintf(buf, sizeof(buf), "MV:%.3f %.3f", (double)mx, (double)my);
-    LCD_Print(10, 180, buf, LCD_MAGENTA, LCD_BLACK);
+    // ════════════════════════════════════════
+    //  Section 3b: ENCODER DIAG  (y = 305 ~ 340)
+    // ════════════════════════════════════════
+    {
+      snprintf(buf, sizeof(buf), "D:%d %d %d %d R:%d F:%d",
+               (int)ed_delta[0], (int)ed_delta[1],
+               (int)ed_delta[2], (int)ed_delta[3],
+               (int)ed_ok, (int)ed_fail);
+      LCD_Print(4, 305, buf, ed_fail ? LCD_RED : LCD_GRAY, LCD_BLACK);
 
+      snprintf(buf, sizeof(buf), "V:%d %d %d %d B:%lu",
+               (int)ed_rpm[0], (int)ed_rpm[1],
+               (int)ed_rpm[2], (int)ed_rpm[3],
+               (unsigned long)ed_bad);
+      LCD_Print(4, 322, buf, ed_bad ? LCD_YELLOW : LCD_GRAY, LCD_BLACK);
+    }
+
+    // ════════════════════════════════════════
+    //  Section 4: TOUCH SCREEN  (y = 320 ~ 470)
+    // ════════════════════════════════════════
+
+    // Read touch state once per cycle
+    TouchPoint_t tp;
+    uint8_t touched = XPT2046_ReadTouch(&tp);
+    uint8_t tap = touched && !prev_touched;  // rising edge = new tap
+
+    // �???�??? Page state machine �???�???
+    if (page_mode == 0) {
+      // �???�??? MAIN PAGE: 4 touch buttons + settings opener �???�???
+      LCD_Print(4, 320, "-- TOUCH --", LCD_YELLOW, LCD_BLACK);
+
+      if (touched) {
+        snprintf(buf, sizeof(buf), "X:%3d Y:%3d", (int)tp.x, (int)tp.y);
+        LCD_Print(4, 340, buf, LCD_GREEN, LCD_BLACK);
+      } else {
+        LCD_Print(4, 340, "X:--- Y:---  ", LCD_GRAY, LCD_BLACK);
+      }
+
+      // [SYNC 0,0] button (x=4~150, y=370~400)
+      uint16_t c1 = LCD_GRAY;
+      if (touched && tp.x <= 150 && tp.y >= 370 && tp.y <= 400) {
+        c1 = LCD_GREEN;
+        if (!btn_sync_held) {
+          btn_sync_held = 1;
+          __disable_irq();
+          g_odom_x = 0.0f; g_odom_y = 0.0f;
+          __enable_irq();
+          Move_InitPose(0.0f, 0.0f, g_imu_yaw);
+        }
+      } else { btn_sync_held = 0; }
+      LCD_Print(4, 370, "[SYNC 0,0]   ", c1, LCD_BLACK);
+
+      // [GOTO 0,0.3] button (x=4~150, y=410~440)
+      uint16_t c2 = LCD_GRAY;
+      if (touched && tp.x <= 150 && tp.y >= 410 && tp.y <= 440) {
+        c2 = LCD_GREEN;
+        if (!btn_goto_held) {
+          btn_goto_held = 1;
+          NavPacket_t nav;
+          nav.cmd = NAV_CMD_GOTO;
+          nav.f[0] = 0.0f; nav.f[1] = 0.3f;
+          xQueueSend(NavQueueHandle, &nav, 10);
+        }
+      } else { btn_goto_held = 0; }
+      LCD_Print(4, 410, "[GOTO 0,0.3] ", c2, LCD_BLACK);
+
+      // [HOME] button (x=160~310, y=410~440)
+      uint16_t c3 = LCD_GRAY;
+      if (touched && tp.x >= 160 && tp.y >= 410 && tp.y <= 440) {
+        c3 = LCD_GREEN;
+        NavPacket_t nav;
+        nav.cmd = NAV_CMD_GOTO;
+        nav.f[0] = 0.0f; nav.f[1] = 0.0f;
+        xQueueSend(NavQueueHandle, &nav, 10);
+      }
+      LCD_Print(160, 410, "[HOME]      ", c3, LCD_BLACK);
+
+      // [SET POSE] button (x=160~310, y=370~400) �??? opens settings page
+      uint16_t c4 = LCD_GRAY;
+      if (touched && tp.x >= 160 && tp.y >= 370 && tp.y <= 400) {
+        c4 = LCD_YELLOW;
+        if (tap) {
+          page_mode = 1;
+          set_x_cm = 0;
+          set_y_cm = 0;
+          set_yaw_i = 0;
+        }
+      }
+      LCD_Print(160, 370, "[SET POSE]  ", c4, LCD_BLACK);
+
+      LCD_Print(4, 450, touch_ok ? "TOUCH: OK" : "TOUCH: FAIL",
+                touch_ok ? LCD_GREEN : LCD_RED, LCD_BLACK);
+
+    } else {
+      // ══════════════════════════════════════
+      //  SETTINGS PAGE: set X, Y, Yaw
+      // ══════════════════════════════════════
+      LCD_Print(4, 315, "-- SET POSE --", LCD_YELLOW, LCD_BLACK);
+
+      // �???�??? Row 1: X (y=335~360) �???�???
+      //  [X-]  X: +0.00 M  [X+]
+      uint16_t xm_c = LCD_GRAY, xp_c = LCD_GRAY;
+      if (touched && tp.x < 70 && tp.y >= 335 && tp.y <= 360) {
+        xm_c = LCD_GREEN;
+        if (tap && set_x_cm > -100) set_x_cm -= 5;
+      }
+      if (touched && tp.x > 250 && tp.y >= 335 && tp.y <= 360) {
+        xp_c = LCD_GREEN;
+        if (tap && set_x_cm < 100) set_x_cm += 5;
+      }
+      LCD_Print(4, 338, "[X-]", xm_c, LCD_BLACK);
+      snprintf(buf, sizeof(buf), "X:%+.2f M", (double)(set_x_cm * 0.05f));
+      LCD_Print(60, 338, buf, LCD_WHITE, LCD_BLACK);
+      LCD_Print(260, 338, "[X+]", xp_c, LCD_BLACK);
+
+      // �???�??? Row 2: Y (y=365~390) �???�???
+      uint16_t ym_c = LCD_GRAY, yp_c = LCD_GRAY;
+      if (touched && tp.x < 70 && tp.y >= 365 && tp.y <= 390) {
+        ym_c = LCD_GREEN;
+        if (tap && set_y_cm > -100) set_y_cm -= 5;
+      }
+      if (touched && tp.x > 250 && tp.y >= 365 && tp.y <= 390) {
+        yp_c = LCD_GREEN;
+        if (tap && set_y_cm < 100) set_y_cm += 5;
+      }
+      LCD_Print(4, 368, "[Y-]", ym_c, LCD_BLACK);
+      snprintf(buf, sizeof(buf), "Y:%+.2f M", (double)(set_y_cm * 0.05f));
+      LCD_Print(60, 368, buf, LCD_WHITE, LCD_BLACK);
+      LCD_Print(260, 368, "[Y+]", yp_c, LCD_BLACK);
+
+      // �???�??? Row 3: YAW (y=395~420) �???�???
+      uint16_t ywm_c = LCD_GRAY, ywp_c = LCD_GRAY;
+      if (touched && tp.x < 70 && tp.y >= 395 && tp.y <= 420) {
+        ywm_c = LCD_GREEN;
+        if (tap) set_yaw_i = (set_yaw_i + 7) % 8;  // -1 mod 8
+      }
+      if (touched && tp.x > 250 && tp.y >= 395 && tp.y <= 420) {
+        ywp_c = LCD_GREEN;
+        if (tap) set_yaw_i = (set_yaw_i + 1) % 8;   // +1 mod 8
+      }
+      LCD_Print(4, 398, "[A-]", ywm_c, LCD_BLACK);
+      snprintf(buf, sizeof(buf), "YAW: %3d DEG", (int)set_yaw_i * 45);
+      LCD_Print(60, 398, buf, LCD_WHITE, LCD_BLACK);
+      LCD_Print(260, 398, "[A+]", ywp_c, LCD_BLACK);
+
+      // �???�??? Row 4: CONFIRM / CANCEL (y=430~460) �???�???
+      uint16_t cf_c = LCD_GRAY, cc_c = LCD_GRAY;
+      if (touched && tp.x < 150 && tp.y >= 430 && tp.y <= 465) {
+        cf_c = LCD_GREEN;
+        if (tap) {
+          // Apply: sync odometry to (x, y) with chosen yaw
+          float sx = set_x_cm * 0.05f;
+          float sy = set_y_cm * 0.05f;
+          __disable_irq();
+          g_odom_x = sx;
+          g_odom_y = sy;
+          __enable_irq();
+          Move_InitPose(sx, sy, (float)set_yaw_i * 45.0f);
+          page_mode = 0;
+        }
+      }
+      if (touched && tp.x >= 160 && tp.y >= 430 && tp.y <= 465) {
+        cc_c = LCD_RED;
+        if (tap) {
+          page_mode = 0;  // cancel, discard values
+        }
+      }
+      LCD_Print(4, 435, "[CONFIRM]    ", cf_c, LCD_BLACK);
+      LCD_Print(160, 435, "[CANCEL]     ", cc_c, LCD_BLACK);
+    }
+
+    prev_touched = touched;
     osDelay(200);  // ~5Hz refresh
   }
 
@@ -683,7 +1017,7 @@ void StartLightTask(void const * argument)
   /* USER CODE BEGIN StartLightTask */
   // 3 fill lights on TIM3 CH1(PB4) / CH2(PB5) / CH3(PB0), 1kHz PWM
   Light_Init();
-  Light_SetAll(0);  // all off at power-on
+  Light_SetAll(100);  // fill lights always on for PMW3901 optical flow
 
   for(;;)
   {
@@ -813,6 +1147,74 @@ void StartNavTask(void const * argument)
           SendNavResultToPC(TYPE_CMD_ARC_RESP, result);
           break;
 
+        case NAV_CMD_PATH:
+          result = MovePathPurePursuit();
+          SendNavResultToPC(TYPE_CMD_PATH_RESP, result);
+          break;
+
+        case NAV_CMD_CALIB_HEIGHT: {
+          /* 挂起OptFlowTask: cal_wait_done直接读PMW3901, 防SPI1竞争 */
+          if (OptFlowTaskHandle) vTaskSuspend(OptFlowTaskHandle);
+          OFlowCalibResult_t cal_res;
+          uint8_t axis = (uint8_t)nav.f[0];
+          float revs = nav.f[1];
+          result = OFlowCalib_Height(axis, revs, &cal_res);
+          /* 发回结果: status(1)+pix_to_m(4)+height(4)+distance(4)+pixels(4)+valid(4)+invalid(4)=25 */
+          {
+            uint8_t buf[32];
+            buf[0] = PROTOCOL_HEADER1; buf[1] = PROTOCOL_HEADER2;
+            buf[2] = TYPE_CMD_CALIB_HEIGHT_RESP;
+            buf[3] = 25;  /* payload len */
+            buf[4] = result;
+            memcpy(&buf[5],  &cal_res.pix_to_m_result, 4);
+            memcpy(&buf[9],  &cal_res.estimated_height_m, 4);
+            memcpy(&buf[13], &cal_res.actual_distance_m, 4);
+            int32_t tp = (axis == 0) ? cal_res.accum_dx_pixels : cal_res.accum_dy_pixels;
+            memcpy(&buf[17], &tp, 4);
+            memcpy(&buf[21], &cal_res.valid_samples, 4);
+            memcpy(&buf[25], &cal_res.invalid_samples, 4);
+            uint16_t crc = CRC16_CCITT(&buf[2], 27);  /* type+len+payload(25) */
+            buf[29] = crc & 0xFF; buf[30] = (crc >> 8) & 0xFF;
+            if (osMutexWait(Uart6MutexHandle, 100) == osOK) {
+              HAL_UART_Transmit(&huart6, buf, 31, 50);
+              osMutexRelease(Uart6MutexHandle);
+            }
+          }
+          if (OptFlowTaskHandle) vTaskResume(OptFlowTaskHandle);
+          break;
+        }
+
+        case NAV_CMD_CALIB_OFFSET: {
+          float ox = 0.0f, oy = 0.0f;
+          result = OFlowCalib_Offset(&ox, &oy);
+          /* 发回结果: status(1)+ox(4)+oy(4)+dx(4)+dy(4)+squal(1)+obs(1)+total_deg(4)=23 */
+          {
+            uint8_t buf[36];
+            buf[0] = PROTOCOL_HEADER1; buf[1] = PROTOCOL_HEADER2;
+            buf[2] = TYPE_CMD_CALIB_OFFSET_RESP;
+            buf[3] = 23;  /* payload len */
+            buf[4] = result;
+            memcpy(&buf[5], &ox, 4);
+            memcpy(&buf[9], &oy, 4);
+            /* 诊断数据: PMW3901 原始累计 (int32) + 表面质量 + 实际转角 */
+            int32_t dbg_dx = calib_dbg_dx;
+            int32_t dbg_dy = calib_dbg_dy;
+            memcpy(&buf[13], &dbg_dx, 4);
+            memcpy(&buf[17], &dbg_dy, 4);
+            buf[21] = calib_dbg_squal;
+            buf[22] = calib_dbg_obs;
+            float dbg_deg = calib_dbg_total_deg;
+            memcpy(&buf[23], &dbg_deg, 4);
+            uint16_t crc = CRC16_CCITT(&buf[2], 25);  /* type+len+payload(23) */
+            buf[27] = crc & 0xFF; buf[28] = (crc >> 8) & 0xFF;
+            if (osMutexWait(Uart6MutexHandle, 100) == osOK) {
+              HAL_UART_Transmit(&huart6, buf, 29, 50);
+              osMutexRelease(Uart6MutexHandle);
+            }
+          }
+          break;
+        }
+
         default:
           break;
       }
@@ -829,6 +1231,37 @@ void SendNavResultToPC(uint8_t type, uint8_t status)
   uint16_t len = PackNavResult(type, status, buf);
   if (osMutexWait(Uart6MutexHandle, 100) == osOK) {
     HAL_UART_Transmit(&huart6, buf, len, 50);
+    osMutexRelease(Uart6MutexHandle);
+  }
+}
+
+/* [调试用,定位后删除] Pure Pursuit 内部状态遥测: 每控制周期发一帧到上位机,
+ * 用于区分"控制器位置冻结"vs"电机不执行命令"。payload 32字节:
+ * move_x(f32)+move_y(f32)+closest(i16)+la(i16)+vx_f(f32)+vy_f(f32)+wz(f32)+target_yaw(f32)
+ * +loop_ms(u16)+enc_ok(u8)+pad(u8) */
+void SendPathDebugToPC(float mx, float my, int16_t closest, int16_t la,
+                       float vx_f, float vy_f, float wz, float target_yaw,
+                       uint16_t loop_ms, uint8_t enc_ok)
+{
+  uint8_t buf[44];
+  buf[0] = PROTOCOL_HEADER1; buf[1] = PROTOCOL_HEADER2;
+  buf[2] = TYPE_CMD_PATH_DEBUG;
+  buf[3] = 32;                       /* payload len */
+  memcpy(&buf[4],  &mx,        4);
+  memcpy(&buf[8],  &my,        4);
+  memcpy(&buf[12], &closest,   2);
+  memcpy(&buf[14], &la,        2);
+  memcpy(&buf[16], &vx_f,      4);
+  memcpy(&buf[20], &vy_f,      4);
+  memcpy(&buf[24], &wz,        4);
+  memcpy(&buf[28], &target_yaw,4);
+  memcpy(&buf[32], &loop_ms,   2);
+  buf[34] = enc_ok;
+  buf[35] = 0;                       /* pad */
+  uint16_t crc = CRC16_CCITT(&buf[2], 34);   /* type+len+payload(32) */
+  buf[36] = crc & 0xFF; buf[37] = (crc >> 8) & 0xFF;
+  if (osMutexWait(Uart6MutexHandle, 100) == osOK) {
+    HAL_UART_Transmit(&huart6, buf, 38, 50);
     osMutexRelease(Uart6MutexHandle);
   }
 }

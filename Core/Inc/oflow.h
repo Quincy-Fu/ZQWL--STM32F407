@@ -23,8 +23,8 @@
 /* ================================================================
  *  配置参数 (用户填入实测值)
  * ================================================================ */
-#define OFLOW_OFFSET_X_M     0.000f   /* 传感器中心相对底盘中心的右偏量 m (待填入) */
-#define OFLOW_OFFSET_Y_M     0.000f   /* 传感器中心相对底盘中心的前偏量 m (待填入) */
+#define OFLOW_OFFSET_X_M     0.000f   /* 传感器相对底盘中心右偏量 m (待重新标定, pix_to_m 已更新) */
+#define OFLOW_OFFSET_Y_M     0.000f   /* 传感器相对底盘中心前偏量 m (待重新标定, pix_to_m 已更新) */
 #define OFLOW_SAMPLE_MS      10       /* 采样周期 ms (100Hz) */
 #define OFLOW_SQUAL_MIN      0x19     /* 最低可信 squal (同 pmw3901.h) */
 #define OFLOW_OMEGA_LPFA     0.3f     /* 角速度低通滤波系数 (0~1, 小=更平滑) */

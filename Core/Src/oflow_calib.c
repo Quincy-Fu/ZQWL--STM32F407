@@ -8,17 +8,24 @@
 #include "pmw3901.h"
 #include "move.h"
 #include "Emm_V5.h"
+#include "light.h"
+#include "shared_vars.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "cmsis_os.h"
 #include <math.h>
 #include <stdlib.h>
+#include <stdio.h>
+
+/* 偏心标定诊断 (Keil Watch 窗口查看) */
+volatile int32_t  calib_dbg_dx;
+volatile int32_t  calib_dbg_dy;
+volatile uint8_t  calib_dbg_squal;
+volatile uint8_t  calib_dbg_obs;
+volatile float    calib_dbg_total_deg;
 
 /* 外部: Emm_V5 电机地址 */
 static const uint8_t cal_wheel_addr[4] = {MOTOR_FL, MOTOR_FR, MOTOR_RL, MOTOR_RR};
-
-/* 外部: Move 层函数 */
-extern volatile uint8_t g_move_active;
 
 /* ================================================================
  *  高度标定
@@ -42,33 +49,40 @@ static void cal_send_pos(const uint8_t dir[4], uint32_t clk)
 }
 
 /**
- * @brief  等待运动结束 (光流连续 N 帧无位移)
+ * @brief  等待运动结束 (时间法: 电机参数已知, 精确计算运动时长)
  *
+ * 不依赖PMW3901噪声检测: 8cm高度下PMW3901噪声不可预测,
+ * 固定阈值和EMA都无法可靠区分运动/停止.
+ * 电机位置模式: 200RPM, 3200脉冲/圈, 运动时间可精确算出.
+ *
+ * @param num_revolutions  电机转动圈数
  * @param accum_dx  [out] 累计像素 X
  * @param accum_dy  [out] 累计像素 Y
  * @param valid     [out] 有效采样数
  * @param invalid   [out] 无效采样数
- * @return 1=正常结束, 0=超时
+ * @return 1=正常结束
  */
 static uint8_t cal_wait_done(int32_t *accum_dx, int32_t *accum_dy,
-                              uint32_t *valid, uint32_t *invalid)
+                              uint32_t *valid, uint32_t *invalid,
+                              float num_revolutions)
 {
     *accum_dx = 0;
     *accum_dy = 0;
     *valid = 0;
     *invalid = 0;
 
+    /* 时间法: 200RPM=3.33rev/s, 每圈0.3s
+     * 总等待 = 运动时间 + 加速余量(1s) + 停止settle(0.5s) */
+    uint32_t motion_ms = (uint32_t)(num_revolutions * 60.0f
+                                   / (float)OFLOW_CAL_VEL_RPM * 1000.0f);
+    uint32_t wait_ms = motion_ms + 1000 + OFLOW_CAL_SETTLE_MS;
+
     uint32_t t0 = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    uint32_t still_count = 0;
-    #define STILL_THRESHOLD  5   /* 连续 5 帧位移 < 5 像素视为停止 */
-    #define STILL_REQUIRED   20  /* 连续 20 次 (200ms) 确认停止 */
 
     for (;;) {
-        /* 超时检查 */
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-        if (now - t0 >= OFLOW_CAL_TIMEOUT_MS) return 0;
+        if (now - t0 >= wait_ms) break;
 
-        /* 读光流 */
         int16_t dx = 0, dy = 0;
         uint8_t squal = 0, obs = 0;
         pmw3901_read_motion(&dx, &dy, &squal, &obs);
@@ -77,19 +91,9 @@ static uint8_t cal_wait_done(int32_t *accum_dx, int32_t *accum_dy,
             (*valid)++;
             *accum_dx += dx;
             *accum_dy += dy;
-
-            /* 停止检测 */
-            if (abs(dx) < STILL_THRESHOLD && abs(dy) < STILL_THRESHOLD) {
-                still_count++;
-            } else {
-                still_count = 0;
-            }
         } else {
             (*invalid)++;
         }
-
-        /* 运动结束: 连续 200ms 无显著位移 */
-        if (still_count >= STILL_REQUIRED) break;
 
         osDelay(OFLOW_CAL_SAMPLE_MS);
     }
@@ -100,6 +104,15 @@ uint8_t OFlowCalib_Height(uint8_t axis, float num_revolutions,
                            OFlowCalibResult_t *result)
 {
     if (!oflow_sensor_ok || num_revolutions <= 0.0f) return 0;
+
+    /* 补光灯全亮 (可见光, 给摄像头用; PMW3901 需 IR 照明, 此灯对它无效) */
+    Light_SetAll(100);
+
+    /* 挂起 OptFlowTask: 它会读 PMW3901 并清零 delta 寄存器,
+     * 与 cal_wait_done 竞争, 导致像素被偷 + 提前判定停止 */
+    if (OptFlowTaskHandle) vTaskSuspend(OptFlowTaskHandle);
+    PMW_CS_HIGH();
+    HAL_Delay(1);
 
     /* 锁定 CAN 总线 */
     g_move_active = 1;
@@ -133,17 +146,23 @@ uint8_t OFlowCalib_Height(uint8_t axis, float num_revolutions,
     uint8_t ok = cal_wait_done(&result->accum_dx_pixels,
                                 &result->accum_dy_pixels,
                                 &result->valid_samples,
-                                &result->invalid_samples);
+                                &result->invalid_samples,
+                                num_revolutions);
 
     /* 停稳后等待 */
     osDelay(OFLOW_CAL_SETTLE_MS);
     g_move_active = 0;
 
-    if (!ok) return 0;
+    if (!ok) {
+        if (OptFlowTaskHandle) vTaskResume(OptFlowTaskHandle);
+        return 0;
+    }
 
     /* 计算结果 */
     result->num_revolutions = num_revolutions;
-    result->actual_distance_m = 3.14159265f * OFLOW_CAL_WHEEL_D_M * num_revolutions;
+    /* 麦轮 45° 滚柱: 轮子转一圈, 机器人前进 π×D×cos45°, 不是 π×D */
+    result->actual_distance_m = 3.14159265f * OFLOW_CAL_WHEEL_D_M
+                                * 0.70710678f * num_revolutions;
 
     /* 取运动轴的累计像素 (前进=Y轴对应 dx_raw, 侧移=X轴对应 dy_raw)
      * 传感器: dx_raw=前后方向, dy_raw=左右方向
@@ -168,6 +187,7 @@ uint8_t OFlowCalib_Height(uint8_t axis, float num_revolutions,
         pmw_pix_to_m = result->pix_to_m_result;
     }
 
+    if (OptFlowTaskHandle) vTaskResume(OptFlowTaskHandle);
     return 1;
 }
 
@@ -179,37 +199,246 @@ uint8_t OFlowCalib_Offset(float *offset_x_out, float *offset_y_out)
 {
     if (!oflow_sensor_ok) return 0;
 
-    /* 清零光流坐标 */
+    Light_SetAll(100);  /* 可见光补光, 对 PMW3901 无效但给摄像头用 */
+
+    if (OptFlowTaskHandle) vTaskSuspend(OptFlowTaskHandle);
+    PMW_CS_HIGH();
+    HAL_Delay(1);
+
     OFlow_Reset();
+
+    /* dummy read: 清 PMW3901 delta 寄存器 (OFlow_Reset 只清软件) */
+    {
+        int16_t ddx, ddy; uint8_t dsq, dob;
+        pmw3901_read_motion(&ddx, &ddy, &dsq, &dob);
+    }
+
     osDelay(OFLOW_CAL_SETTLE_MS);
+    g_move_active = 1;
 
-    /* 原地转 360° (CW 正, 即 +360°)
-     * RotateTo 会设置 g_move_active=1, 阻塞等待完成 */
-    uint8_t ok = RotateTo(360.0f, MOVE_YAW_TURN_LIMIT);
-
-    osDelay(OFLOW_CAL_SETTLE_MS);
-
-    if (!ok) return 0;
-
-    /* 读取光流累计位移 (场坐标, 理论应为零) */
-    float fx, fy;
-    OFlow_GetPose(&fx, &fy);
-
-    /* 反推偏移量:
-     * 转一圈 (2π 弧度) 的光流位移:
-     *   oflow_x ≈ -2π * Ly  → Ly = -oflow_x / (2π)
-     *   oflow_y ≈  2π * Lx  → Lx =  oflow_y / (2π)
+    /* ── 慢速转 360° + 循环读 PMW3901 + 软件累加 ──
      *
-     * 推导: 偏心补偿公式 dx_center = dx_sensor + dθ * Ly
-     *   如果 Lx/Ly 设错, 转一圈后:
-     *   Δoflow_x = ∫(补偿误差_x) = -2π * (Ly_true - Ly_set)
-     *   Δoflow_y = ∫(补偿误差_y) =  2π * (Lx_true - Lx_set)
-     *   这里 Ly_set=0, Lx_set=0 (初始), 所以直接反推 */
-    const float TWO_PI = 6.28318530f;
-    *offset_x_out =  fy / TWO_PI;   /* 右偏量 m */
-    *offset_y_out = -fx / TWO_PI;   /* 前偏量 m */
+     * PMW3901 是鼠标传感器, delta 寄存器必须频繁读取.
+     *
+     * 刚体运动学推导:
+     *   传感器在车体系位置 (Lx, Ly) 固定, 角速度 ω 时
+     *   v_body = ω × r = (-ω·Ly, ω·Lx)  — 常量! 不随 θ 变化
+     *   360° 积分 = v_body × T = v_body × 2π/|ω| → 积分结果是 2π, 不是 π
+     *
+     *   accum_dx =  2π·Lx / pix_to_m  (CW)
+     *   accum_dy = -2π·Ly / pix_to_m  (CW)
+     *
+     *   → Lx = accum_dx × pix_to_m / (2π)
+     *   → Ly = -accum_dy × pix_to_m / (2π)
+     */
+    const float TARGET_DEG  = 360.0f;
+    const float DECEL_DEG   = 60.0f;
+    const float CAL_SPEED   = 0.05f;
+    const float TWO_PI      = 6.28318531f;
+
+    uint32_t t0 = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+    Move_SetRobotVelocity(0.0f, 0.0f, CAL_SPEED);
+    osDelay(50);
+
+    float prev_yaw = g_imu_yaw;
+    float total_rotation = 0.0f;
+    /* 双轨累加: filtered (和高度标定一致) + unfiltered (fallback) */
+    int32_t accum_dx_filt = 0, accum_dy_filt = 0;  /* 过滤后 (仅 valid) */
+    int32_t accum_dx_raw  = 0, accum_dy_raw  = 0;  /* 不过滤 (全部) */
+    uint32_t valid_cnt = 0, invalid_cnt = 0;
+    uint8_t last_squal = 0, last_obs = 0;
+
+    for (;;) {
+        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if (now - t0 >= OFLOW_CAL_TIMEOUT_MS) goto fail;
+
+        /* 减速区: 只在剩余 < 60° 时更新速度 */
+        float remaining = TARGET_DEG - fabsf(total_rotation);
+        if (remaining < DECEL_DEG) {
+            float spd;
+            if (remaining <= 0.0f) {
+                spd = MOVE_YAW_FINE_SPEED;
+            } else {
+                spd = MOVE_YAW_FINE_SPEED
+                      + (CAL_SPEED - MOVE_YAW_FINE_SPEED)
+                        * (remaining / DECEL_DEG);
+            }
+            Move_SetRobotVelocity(0.0f, 0.0f, spd);
+        }
+
+        /* 读 PMW3901 */
+        int16_t dx = 0, dy = 0;
+        uint8_t squal = 0, obs = 0;
+        pmw3901_read_motion(&dx, &dy, &squal, &obs);
+        last_squal = squal;
+        last_obs = obs;
+
+        /* 双轨累加 */
+        accum_dx_raw += dx;
+        accum_dy_raw += dy;
+
+        /* 过滤累加: 和高度标定 cal_wait_done 用同一条件
+         * pix_to_m 是用过滤后的像素算的, 偏心标定也必须用过滤后的,
+         * 否则噪声样本膨胀累计, 偏移结果放大数十倍 */
+        if (obs == PMW_OBSERVATION_OK && squal >= OFLOW_SQUAL_MIN) {
+            accum_dx_filt += dx;
+            accum_dy_filt += dy;
+            valid_cnt++;
+        } else {
+            invalid_cnt++;
+        }
+
+        /* IMU 角度累计 */
+        float cur_yaw = g_imu_yaw;
+        float dyaw = cur_yaw - prev_yaw;
+        while (dyaw > 180.0f)  dyaw -= 360.0f;
+        while (dyaw < -180.0f) dyaw += 360.0f;
+        total_rotation += dyaw;
+        prev_yaw = cur_yaw;
+
+        if (fabsf(total_rotation) >= TARGET_DEG) break;
+
+        osDelay(OFLOW_CAL_SAMPLE_MS);
+    }
+
+    Move_Stop();
+
+    /* ── 等待惯性停止 ──
+     * 电机已急停锁死, 但IMU有LPF滞后, 继续读PMW3901+IMU直到稳定,
+     * 捕获真实总转角(含残余转动/IMU追赶), 用实际角度算偏移公式 */
+    {
+        uint32_t stop_t0 = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        uint32_t still_cnt = 0;
+
+        for (;;) {
+            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if (now - stop_t0 >= 1000) break;  /* 最多等 1 秒 */
+
+            int16_t dx2 = 0, dy2 = 0;
+            uint8_t sq2 = 0, ob2 = 0;
+            pmw3901_read_motion(&dx2, &dy2, &sq2, &ob2);
+            accum_dx_raw += dx2;
+            accum_dy_raw += dy2;
+            if (ob2 == PMW_OBSERVATION_OK && sq2 >= OFLOW_SQUAL_MIN) {
+                accum_dx_filt += dx2;
+                accum_dy_filt += dy2;
+                valid_cnt++;
+            } else {
+                invalid_cnt++;
+            }
+            last_squal = sq2;
+            last_obs = ob2;
+
+            float cur_yaw = g_imu_yaw;
+            float dyaw = cur_yaw - prev_yaw;
+            while (dyaw > 180.0f)  dyaw -= 360.0f;
+            while (dyaw < -180.0f) dyaw += 360.0f;
+            total_rotation += dyaw;
+            prev_yaw = cur_yaw;
+
+            if (fabsf(dyaw) < 0.1f) {
+                still_cnt++;
+                if (still_cnt >= 20) break;  /* 200ms 稳定 */
+            } else {
+                still_cnt = 0;
+            }
+
+            osDelay(OFLOW_CAL_SAMPLE_MS);
+        }
+    }
+
+    g_move_active = 0;
+    if (OptFlowTaskHandle) vTaskResume(OptFlowTaskHandle);
+
+    /* 选择累加源: 优先用过滤后的 (和高度标定一致), fallback 到不过滤 */
+    int32_t use_dx, use_dy;
+    if (valid_cnt > 0) {
+        use_dx = accum_dx_filt;
+        use_dy = accum_dy_filt;
+    } else {
+        use_dx = accum_dx_raw;
+        use_dy = accum_dy_raw;
+    }
+
+    /* 诊断存入全局变量 */
+    calib_dbg_dx        = use_dx;
+    calib_dbg_dy        = use_dy;
+    calib_dbg_squal     = last_squal;
+    calib_dbg_obs       = last_obs;
+    calib_dbg_total_deg = total_rotation;
+
+    /* 公式: v_body=ω×r 常量, 积分 = r × actual_angle
+     * actual_angle 含惯性过冲 (如 375° 而非 360°), 不是假设值
+     * offset_x = accum_dx × pix_to_m / actual_rad
+     * offset_y = -accum_dy × pix_to_m / actual_rad */
+    float actual_rad = fabsf(total_rotation) * 0.01745329f;
+    if (actual_rad < 0.1f) actual_rad = TWO_PI;  /* fallback */
+    *offset_x_out =  (float)use_dx * pmw_pix_to_m / actual_rad;
+    *offset_y_out = -(float)use_dy * pmw_pix_to_m / actual_rad;
 
     return 1;
+
+fail:
+    Move_Stop();
+
+    /* 超时: 同样等待惯性停止 */
+    {
+        uint32_t stop_t0 = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        uint32_t still_cnt = 0;
+        for (;;) {
+            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if (now - stop_t0 >= 1000) break;
+
+            int16_t dx2 = 0, dy2 = 0;
+            uint8_t sq2 = 0, ob2 = 0;
+            pmw3901_read_motion(&dx2, &dy2, &sq2, &ob2);
+            accum_dx_raw += dx2; accum_dy_raw += dy2;
+            if (ob2 == PMW_OBSERVATION_OK && sq2 >= OFLOW_SQUAL_MIN) {
+                accum_dx_filt += dx2; accum_dy_filt += dy2; valid_cnt++;
+            } else { invalid_cnt++; }
+            last_squal = sq2; last_obs = ob2;
+
+            float cur_yaw = g_imu_yaw;
+            float dyaw = cur_yaw - prev_yaw;
+            while (dyaw > 180.0f)  dyaw -= 360.0f;
+            while (dyaw < -180.0f) dyaw += 360.0f;
+            total_rotation += dyaw;
+            prev_yaw = cur_yaw;
+
+            if (fabsf(dyaw) < 0.1f) {
+                still_cnt++;
+                if (still_cnt >= 20) break;
+            } else {
+                still_cnt = 0;
+            }
+            osDelay(OFLOW_CAL_SAMPLE_MS);
+        }
+    }
+
+    g_move_active = 0;
+    if (OptFlowTaskHandle) vTaskResume(OptFlowTaskHandle);
+
+    /* 诊断也要存 (超时也能看到转了多少、squal 多少) */
+    int32_t fail_dx = (valid_cnt > 0) ? accum_dx_filt : accum_dx_raw;
+    int32_t fail_dy = (valid_cnt > 0) ? accum_dy_filt : accum_dy_raw;
+    calib_dbg_dx        = fail_dx;
+    calib_dbg_dy        = fail_dy;
+    calib_dbg_squal     = last_squal;
+    calib_dbg_obs       = last_obs;
+    calib_dbg_total_deg = total_rotation;
+
+    /* 超时但有数据: 按实际转角计算 (含过冲) */
+    if (fabsf(total_rotation) > 10.0f) {
+        float actual_rad = fabsf(total_rotation) * 0.01745329f;
+        *offset_x_out =  (float)fail_dx * pmw_pix_to_m / actual_rad;
+        *offset_y_out = -(float)fail_dy * pmw_pix_to_m / actual_rad;
+        return 1;
+    }
+
+    *offset_x_out = 0.0f;
+    *offset_y_out = 0.0f;
+    return 0;
 }
 
 /* ================================================================

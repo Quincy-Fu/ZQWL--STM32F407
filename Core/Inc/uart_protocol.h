@@ -31,6 +31,16 @@
 #define TYPE_CMD_SYNC_RESP       0x1B
 #define TYPE_CMD_ARC             0x1C
 #define TYPE_CMD_ARC_RESP        0x1D
+#define TYPE_CMD_CALIB_HEIGHT    0x1E
+#define TYPE_CMD_CALIB_HEIGHT_RESP 0x1F
+#define TYPE_CMD_CALIB_OFFSET   0x20
+#define TYPE_CMD_CALIB_OFFSET_RESP 0x21
+// Pure Pursuit 路径跟踪 (上位机预插值密集点, MCU端自主跟踪)
+#define TYPE_CMD_PATH_BEGIN     0x22   // payload: speed(f32)+count(u8)
+#define TYPE_CMD_PATH_POINT     0x23   // payload: x(f32)+y(f32)+heading(f32), heading=999=自由点
+#define TYPE_CMD_PATH_EXEC      0x24   // payload: 空, 触发执行
+#define TYPE_CMD_PATH_RESP      0x25   // payload: result(u8) 1=完成 0=超时/中止
+#define TYPE_CMD_PATH_DEBUG     0x26   // [调试用,定位后删除] MCU→PC: move_x/y+closest+la+vx_f/vy_f+wz+target_yaw
 
 // ????payload?? (3?float)
 #define PAYLOAD_SIZE_VEL         12
@@ -80,6 +90,9 @@ bool UartParser_FeedByte(UartParser_t* parser, uint8_t byte, uint8_t* out_type, 
 #define NAV_CMD_FINE_MOVE  0x05
 #define NAV_CMD_SYNC_POSE  0x06
 #define NAV_CMD_ARC        0x07
+#define NAV_CMD_CALIB_HEIGHT 0x08
+#define NAV_CMD_CALIB_OFFSET 0x09
+#define NAV_CMD_PATH       0x0A
 
 typedef struct {
     uint8_t  cmd;

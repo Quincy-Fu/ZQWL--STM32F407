@@ -4,9 +4,19 @@
 /* Init debug: check these in Keil Watch when pmw3901_init() fails
  * pmw_init_step: 0=not run, 1=ProductID fail, 2=InvProductID fail,
  *                3=OptRegs fail, 4=Observation fail, 0xFF=success
- * pmw_debug_reg_val: actual value read from the failing register */
+ * pmw_debug_reg_val: actual value read from the failing register
+ * pmw_diag_regs[0..3]: Product_ID, Revision_ID, Inv_Product_ID, Observation */
 volatile uint8_t pmw_init_step    = 0;
 volatile uint8_t pmw_debug_reg_val = 0;
+volatile uint8_t pmw_diag_regs[4] = {0};
+
+/* Motion Burst 诊断 */
+volatile uint8_t  pmw_burst_raw[12] = {0};
+volatile uint16_t pmw_last_shutter  = 0;
+volatile uint8_t  pmw_last_raw_max  = 0;
+volatile uint8_t  pmw_last_raw_min  = 0;
+volatile uint8_t  pmw_last_raw_sum  = 0;
+volatile uint8_t  pmw_last_motion   = 0;
 
 /* 像素→米比例系数 (运行时可由 oflow_calib 更新) */
 float pmw_pix_to_m = PMW_PIX_TO_M_DEFAULT;
@@ -79,14 +89,23 @@ void pmw3901_read_motion(int16_t *dx, int16_t *dy, uint8_t *squal, uint8_t *obs)
     PMW_CS_HIGH();
     pmw_delay_us(1);                              /* t_BEXIT ≥ 500ns */
 
-    /* datasheet 7.2 motion burst report:
+    /* datasheet 7.2 motion burst report (参考 pmw3901mb 库校正):
        BYTE[0]=Motion  BYTE[1]=Observation
        BYTE[2..3]=Delta_X  BYTE[4..5]=Delta_Y
-       BYTE[6]=SQUAL */
+       BYTE[6]=SQUAL  BYTE[7]=RawSum  BYTE[8]=RawMax
+       BYTE[9]=RawMin  BYTE[10..11]=Shutter(13bit) */
     *obs   = rx[1];
     *dx    = (int16_t)(((uint16_t)rx[3] << 8) | rx[2]);
     *dy    = (int16_t)(((uint16_t)rx[5] << 8) | rx[4]);
     *squal = rx[6];
+
+    /* 诊断: 存完整原始数据 + 解析关键字段 */
+    for (uint8_t i = 0; i < 12; i++) pmw_burst_raw[i] = rx[i];
+    pmw_last_motion   = rx[0];
+    pmw_last_raw_sum  = rx[7];
+    pmw_last_raw_max  = rx[8];
+    pmw_last_raw_min  = rx[9];
+    pmw_last_shutter  = (uint16_t)(((uint16_t)(rx[10] & 0x1F) << 8) | rx[11]);
 }
 
 /* ---- Performance Optimization Registers (datasheet Table 10) ----
@@ -222,6 +241,25 @@ static bool pmw3901_init_opt_regs(void)
     return true;
 }
 
+/* ---- 外部 IR LED 控制 (参考 STM32_PMW3901_Driver) ----
+ * PMW3901 芯片本身不含 IR LED! LED_N (Pin20) 是输出引脚,
+ * 驱动外部三极管+IR LED 电路 (datasheet Appendix B Fig.20).
+ * ATK-PMW3901 模块原理图预留了 LED1 焊盘 + 三极管, 但出厂默认未焊接.
+ * 此函数配置 LED_N 引脚行为 (bank0x14 reg0x6F=0x1C 持续驱动),
+ * 若外部无 LED 则无任何照明效果.
+ * 未焊 IR LED 时传感器仅靠环境光 (>60Lux), shutter 会偏高,
+ * 追踪质量下降但理论上仍可工作. */
+volatile uint8_t pmw_led_readback = 0;  /* Keil Watch: 回读 0x6F 验证写入 */
+
+void pmw3901_set_led(uint8_t on)
+{
+    HAL_Delay(50);                              /* 参考代码要求稳定后再写 */
+    pmw3901_write_reg(0x7F, 0x14);              /* 切到 bank 0x14 */
+    pmw3901_write_reg(0x6F, on ? 0x1C : 0x00);  /* 0x1C=LED开, 0x00=LED关 */
+    pmw_led_readback = pmw3901_read_reg(0x6F);  /* 回读验证 */
+    pmw3901_write_reg(0x7F, 0x00);              /* 回 bank 0 */
+}
+
 /* ---- 完整初始化 (datasheet 5.1 + Table 10) ---- */
 
 bool pmw3901_init(void)
@@ -236,7 +274,23 @@ bool pmw3901_init(void)
     PMW_CS_HIGH();
     HAL_Delay(1);
 
-    /* 2. 验证 SPI 通: 读 Product_ID 应 0x49, Inverse_Product_ID 应 0xB6 */
+    /* 2. 诊断: 读 4 个关键寄存器 (Keil Watch 看 pmw_diag_regs)
+     *    注意: 上电后低地址寄存器可能不准, 仅作诊断参考 */
+    pmw_diag_regs[0] = pmw3901_read_reg(PMW_REG_PRODUCT_ID);      /* 期望 0x49 */
+    pmw_diag_regs[1] = pmw3901_read_reg(PMW_REG_REVISION_ID);     /* 期望 0x01 */
+    pmw_diag_regs[2] = pmw3901_read_reg(PMW_REG_INV_PRODUCT_ID);  /* 期望 0xB6 */
+    pmw_diag_regs[3] = pmw3901_read_reg(PMW_REG_OBSERVATION);     /* 期望 0xBF */
+
+    /* 3. 先 Power_Up_Reset, 再清读 motion 寄存器 (datasheet 要求的顺序) */
+    pmw3901_write_reg(PMW_REG_POWER_UP_RESET, 0x5A);
+    HAL_Delay(2);                                 /* 等 ≥1ms */
+    pmw3901_read_reg(0x02);
+    pmw3901_read_reg(0x03);
+    pmw3901_read_reg(0x04);
+    pmw3901_read_reg(0x05);
+    pmw3901_read_reg(0x06);
+
+    /* 4. 验证 SPI 通: 读 Product_ID 应 0x49, Inverse_Product_ID 应 0xB6 */
     pmw_init_step = 1;
     pmw_debug_reg_val = pmw3901_read_reg(PMW_REG_PRODUCT_ID);
     if (pmw_debug_reg_val != PMW_PRODUCT_ID_VAL) return false;
@@ -245,20 +299,13 @@ bool pmw3901_init(void)
     pmw_debug_reg_val = pmw3901_read_reg(PMW_REG_INV_PRODUCT_ID);
     if (pmw_debug_reg_val != PMW_INV_PRODUCT_ID_VAL) return false;
 
-    /* 3. 写 0x5A 到 Power_Up_Reset 寄存器 */
-    pmw3901_write_reg(PMW_REG_POWER_UP_RESET, 0x5A);
-    HAL_Delay(2);                                 /* 等 ≥1ms */
-
-    /* 4. 读 0x02~0x06 各一次 (不管 motion pin) */
-    pmw3901_read_reg(0x02);
-    pmw3901_read_reg(0x03);
-    pmw3901_read_reg(0x04);
-    pmw3901_read_reg(0x05);
-    pmw3901_read_reg(0x06);
-
     /* 5. Performance Optimization Registers */
     pmw_init_step = 3;
     if (!pmw3901_init_opt_regs()) return false;
+
+    /* 5b. 开启内部 IR LED — 不开则 shutter 飙高、帧率极低、追踪丢失 */
+    HAL_Delay(10);
+    pmw3901_set_led(1);
 
     /* 6. 验证 Observation: 写 0x00 等 15ms 读应 0xBF */
     pmw_init_step = 4;
@@ -269,4 +316,32 @@ bool pmw3901_init(void)
 
     pmw_init_step = 0xFF;  /* success */
     return true;
+}
+
+/* ---- 诊断: 直接读寄存器 shutter (交叉验证 burst 解析) ----
+ * 若 pmw3901_read_shutter_regs() == pmw_last_shutter → burst 解析正确
+ * 若不等 → burst 字节对齐有问题
+ * 若多次调用值不变 → 传感器自动曝光未调整 (可能无帧产生) */
+volatile uint16_t pmw_shutter_direct = 0;   /* 直接读 0x0B/0x0C */
+volatile uint16_t pmw_shutter_prev   = 0;   /* 上一次 burst shutter */
+volatile uint16_t pmw_shutter_same_cnt = 0; /* 连续不变计数 */
+
+uint16_t pmw3901_read_shutter_regs(void)
+{
+    /* datasheet: 先读 Shutter_Upper(0x0C), 再读 Shutter_Lower(0x0B) */
+    uint8_t upper = pmw3901_read_reg(0x0C);
+    uint8_t lower = pmw3901_read_reg(0x0B);
+    uint16_t val = (uint16_t)(((uint16_t)(upper & 0x1F) << 8) | lower);
+    pmw_shutter_direct = val;
+    return val;
+}
+
+void pmw3901_update_frame_health(void)
+{
+    if (pmw_last_shutter == pmw_shutter_prev) {
+        if (pmw_shutter_same_cnt < 60000) pmw_shutter_same_cnt++;
+    } else {
+        pmw_shutter_same_cnt = 0;
+    }
+    pmw_shutter_prev = pmw_last_shutter;
 }

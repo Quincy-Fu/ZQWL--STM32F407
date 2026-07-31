@@ -40,6 +40,12 @@ typedef struct {
 	__IO uint8_t txData[32];
 
 	__IO bool rxFrameFlag;
+
+	/* ISR frame snapshot: 每次FIFO drain保存�?后一帧的完整副本,
+	 * move.c / OdomTask 从此读取, 避免共享 rxData 被覆盖导�?
+	 * 部分读取(如符号字节被篡改). */
+	CAN_RxHeaderTypeDef rxSnap;
+	uint8_t             rxSnapData[8];
 }CAN_t;
 
 /* USER CODE END Includes */

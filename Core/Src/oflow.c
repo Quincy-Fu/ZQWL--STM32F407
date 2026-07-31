@@ -18,13 +18,12 @@
 #include "oflow.h"
 #include "pmw3901.h"
 #include "move.h"
+#include "light.h"
+#include "shared_vars.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "cmsis_os.h"
 #include <math.h>
-
-/* 外部变量 */
-extern volatile float g_imu_yaw;   /* IMU 航向 ° (CCW正), freertos.c */
 
 /* ================================================================
  *  全局变量定义
@@ -89,6 +88,11 @@ void OFlow_TaskLoop(void)
     }
     oflow_sensor_ok = 1;
 
+    /* 开启补光灯 (可见光, 给摄像头用).
+     * 注意: PMW3901 有 IR 滤光片, 只透 ~850nm, 可见光对它无效.
+     * 光流照明需靠 IR LED (ATK 模块 LED1 焊盘) 或足够环境光 (>60Lux). */
+    Light_SetAll(100);
+
     /* 清零累计 */
     OFlow_Reset();
 
@@ -102,12 +106,21 @@ void OFlow_TaskLoop(void)
 
     /* ---- 主循环 ---- */
     TickType_t last_tick = xTaskGetTickCount();
+    uint32_t bad_streak = 0;  /* 连续故障帧计数 (ATK手册: 100帧=1s 判定故障) */
 
     for (;;) {
         /* 1. 读 Motion Burst */
         int16_t dx_raw = 0, dy_raw = 0;
         uint8_t squal = 0, obs = 0;
         pmw3901_read_motion(&dx_raw, &dy_raw, &squal, &obs);
+        pmw3901_update_frame_health();
+
+        /* 运行时故障检测: raw_max==0 && raw_min==0 连续 1s → 传感器故障 */
+        if (pmw_last_raw_max == 0 && pmw_last_raw_min == 0) {
+            if (++bad_streak >= 100) oflow_sensor_ok = 0;
+        } else {
+            bad_streak = 0;
+        }
 
         /* 2. 有效性检查 */
         bool valid = (obs == PMW_OBSERVATION_OK) && (squal >= OFLOW_SQUAL_MIN);

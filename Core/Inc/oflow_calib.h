@@ -7,10 +7,12 @@
  *    同时累计光流像素, 算出 pix_to_m 比例系数.
  *
  * 2. 偏心偏移标定 (offset_x/y):
- *    让车原地转 360° (用 RotateTo), 光流理论位移应为零.
- *    不为零的差值反推 Lx/Ly:
- *      Lx = oflow_y_360 / (2π)
- *      Ly = -oflow_x_360 / (2π)
+ *    慢速原地转 360° (Move_SetRobotVelocity + IMU 累计角度),
+ *    PMW3901 delta 寄存器自然累计整圈像素, 转完一次读出.
+ *    刚体运动学: v_body = ω × r = (-ω·Ly, ω·Lx) 常量,
+ *    360° 积分系数 = 2π (不是 π), 实际用 actual_rad (含过冲):
+ *      offset_x =  accum_dx × pix_to_m / actual_rad
+ *      offset_y = -accum_dy × pix_to_m / actual_rad
  *
  * 所有标定函数阻塞执行, 在 NavTask 或 Keil 调试器中调用.
  */
@@ -29,7 +31,7 @@
 #define OFLOW_CAL_WHEEL_D_M      0.065f   /* 轮径 m */
 #define OFLOW_CAL_SAMPLE_MS      10       /* 标定期间光流采样周期 ms */
 #define OFLOW_CAL_SETTLE_MS      500      /* 启动/停止后等待稳定 ms */
-#define OFLOW_CAL_TIMEOUT_MS     15000    /* 单次标定超时 ms */
+#define OFLOW_CAL_TIMEOUT_MS     40000    /* 偏心标定超时: 360°@17°/s+减速+settle≈28s */
 
 /* ================================================================
  *  标定结果结构体
@@ -73,18 +75,28 @@ uint8_t OFlowCalib_Height(uint8_t axis, float num_revolutions,
                            OFlowCalibResult_t *result);
 
 /**
- * @brief  偏心偏移标定: 原地转 360° 反推 offset_x/y
+ * @brief  偏心偏移标定: 慢速原地转 360°, 反推 offset_x/y
  *
  * 步骤:
- *   1. 清零光流累计
- *   2. 调用 RotateTo(360°, ...) 让车原地转一圈
- *   3. 读光流累计位移 (理论应为零)
- *   4. 反推: Lx = oflow_y / (2π), Ly = -oflow_x / (2π)
- *   5. 更新全局 oflow 偏移参数
+ *   1. 开补光灯 + 挂起 OptFlowTask + PMW_CS_HIGH 防 SPI 竞争
+ *   2. OFlow_Reset 清软件累计 + dummy read 清 PMW3901 delta 寄存器
+ *   3. Move_SetRobotVelocity 慢速 (0.05m/s) 持续旋转,
+ *      循环内每 10ms 读 PMW3901 + 软件累加 int32_t (不过滤!)
+ *   4. IMU dyaw 逐样本归一化累计, |total|>=360° 停
+ *   5. 最后 60° 线性减速 (防惯性过冲)
  *
- * @param  offset_x_out  [out] 标定得到的 X 偏移量 m (右正)
- * @param  offset_y_out  [out] 标定得到的 Y 偏移量 m (前正)
- * @return 1=成功, 0=失败
+ * 刚体运动学: 传感器在车体系位置 (Lx,Ly) 固定, 角速度 ω 时
+ *   v_body = ω × r = (-ω·Ly, ω·Lx) — 常量! 不随 θ 变化
+ *   360° 积分 = v_body × 2π/|ω| → 系数是 2π 不是 π
+ *   accum_dx =  2π·Lx / pix_to_m  → Lx = accum_dx·pix_to_m / (2π)
+ *   accum_dy = -2π·Ly / pix_to_m  → Ly = -accum_dy·pix_to_m / (2π)
+ *
+ * 超时容错: 即使超时, 若已转 >10° 且有数据, 按比例折算后返回 1.
+ * 诊断数据在成功/失败两条路径都存入全局变量.
+ *
+ * @param  offset_x_out  [out] X 偏移量 m (右正, 传感器相对旋转中心)
+ * @param  offset_y_out  [out] Y 偏移量 m (前正)
+ * @return 1=成功(含超时但有数据), 0=完全失败
  */
 uint8_t OFlowCalib_Offset(float *offset_x_out, float *offset_y_out);
 

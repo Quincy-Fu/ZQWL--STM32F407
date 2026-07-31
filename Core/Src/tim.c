@@ -254,4 +254,45 @@ void HAL_TIM_Base_MspDeInit(TIM_HandleTypeDef* tim_baseHandle)
 
 /* USER CODE BEGIN 1 */
 
+/* PA3 = TIM5_CH4 (AF2), 1kHz PWM, 补光灯4
+ * 与 TIM3 相同参数: 84MHz / 84 / 1000 = 1kHz, ARR=999 → 0.1% 分辨率
+ * 放在 USER CODE 区, CubeMX 重生成不覆盖 */
+TIM_HandleTypeDef htim5;
+
+void MX_TIM5_Init(void)
+{
+    __HAL_RCC_TIM5_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    /* PA3 → TIM5_CH4, AF2 */
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Pin       = GPIO_PIN_3;
+    gpio.Mode      = GPIO_MODE_AF_PP;
+    gpio.Pull      = GPIO_NOPULL;
+    gpio.Speed     = GPIO_SPEED_FREQ_LOW;
+    gpio.Alternate = GPIO_AF2_TIM5;
+    HAL_GPIO_Init(GPIOA, &gpio);
+
+    htim5.Instance               = TIM5;
+    htim5.Init.Prescaler         = 83;
+    htim5.Init.CounterMode       = TIM_COUNTERMODE_UP;
+    htim5.Init.Period            = 999;
+    htim5.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
+    htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    HAL_TIM_Base_Init(&htim5);
+
+    TIM_ClockConfigTypeDef clk = { .ClockSource = TIM_CLOCKSOURCE_INTERNAL };
+    HAL_TIM_ConfigClockSource(&htim5, &clk);
+    HAL_TIM_PWM_Init(&htim5);
+
+    TIM_OC_InitTypeDef oc = {0};
+    oc.OCMode     = TIM_OCMODE_PWM1;
+    oc.Pulse      = 0;
+    oc.OCPolarity = TIM_OCPOLARITY_HIGH;
+    oc.OCFastMode = TIM_OCFAST_DISABLE;
+    HAL_TIM_PWM_ConfigChannel(&htim5, &oc, TIM_CHANNEL_4);
+
+    HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_4);
+}
+
 /* USER CODE END 1 */

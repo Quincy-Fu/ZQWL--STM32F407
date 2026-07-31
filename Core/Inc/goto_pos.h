@@ -22,13 +22,13 @@
  * ================================================================ */
 
 /* 第一次主移动 */
-#define GOTO_DEFAULT_SPEED      0.15f   /* m/s */
+#define GOTO_DEFAULT_SPEED      0.70f   /* m/s [第四档提速, 0.60→0.70] */
 
 /* 二次纠偏 (低速精修) */
-#define GOTO_CORRECT_SPEED      0.04f   /* m/s */
+#define GOTO_CORRECT_SPEED      0.25f   /* m/s [第二档提速, 配合减速区快速接近+平滑制动] */
 #define GOTO_CORRECT_TOL        0.005f  /* m (5mm) */
-#define GOTO_CORRECT_MAX_TIMES  1       /* 最多纠偏轮数 */
-#define GOTO_CORRECT_TIMEOUT_MS 1100    /* 每轮超时 ms */
+#define GOTO_CORRECT_MAX_TIMES  3       /* 最多纠偏轮数 (斜线残余误差需多轮修正) */
+#define GOTO_CORRECT_TIMEOUT_MS 2000    /* 每轮超时 ms */
 
 /* 轴锁定 */
 #define GOTO_AXIS_LOCK_SPEED    0.015f  /* m/s 副轴纠正速度 */

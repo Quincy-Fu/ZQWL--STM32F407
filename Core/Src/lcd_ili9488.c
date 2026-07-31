@@ -114,9 +114,9 @@ void LCD_Init(void)
     LCD_WriteCmd(0xE9);                 // Set image function
     LCD_WriteData(0x00);
 
-    // MADCTL: MY=0 MX=0 MV=0 ML=0 BGR=1 MH=0 (portrait, top-left origin)
+    // MADCTL: MY=1 MX=1 MV=0 ML=0 BGR=1 MH=0 (portrait 180° rotated)
     LCD_WriteCmd(0x36);
-    LCD_WriteData(0x08);
+    LCD_WriteData(0xC8);
 
     // Positive gamma (0xE0)
     LCD_WriteCmd(0xE0);
@@ -202,9 +202,9 @@ void LCD_FillRect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color
     LCD_CS_HIGH();
 }
 
-/* ---- 8x16 ASCII font (subset: space, 0-9, :, A-Z, ., -, /, (, )) ---- */
+/* ---- 8x16 ASCII font (subset: space, 0-9, :, A-Z, ., -, /, (, ), +) ---- */
 /* Each char = 16 bytes (rows), MSB = leftmost pixel */
-static const uint8_t font_8x16[43][16] = {
+static const uint8_t font_8x16[44][16] = {
     // [0] ' ' (space)
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
@@ -334,6 +334,9 @@ static const uint8_t font_8x16[43][16] = {
     // [42] ')'
     {0x60,0x30,0x18,0x18,0x0C,0x0C,0x0C,0x0C,
      0x0C,0x0C,0x0C,0x18,0x18,0x30,0x60,0x00},
+    // [43] '+'
+    {0x00,0x00,0x18,0x18,0x18,0x18,0xFE,0x00,
+     0xFE,0x18,0x18,0x18,0x18,0x00,0x00,0x00},
 };
 
 /* Map ASCII char → font index, returns -1 if not in subset */
@@ -348,6 +351,7 @@ static int font_index(char c)
     if (c == '/') return 40;
     if (c == '(') return 41;
     if (c == ')') return 42;
+    if (c == '+') return 43;
     return -1;  // not in font, will render as space
 }
 

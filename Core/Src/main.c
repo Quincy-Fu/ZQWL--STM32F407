@@ -116,18 +116,19 @@ int main(void)
   MX_SPI2_Init();
   MX_TIM2_Init();
   MX_TIM3_Init();
+  MX_SPI3_Init();
   /* USER CODE BEGIN 2 */
 
-  USER_CAN1_Filter_Init();                                                                  // 初始化CAN过滤�?????
+  USER_CAN1_Filter_Init();                                                                  // 初始化CAN过滤�??????
   if(HAL_CAN_Start(&hcan1) != HAL_OK) { Error_Handler(); }                                  // 启动CAN外设
   if(HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) { Error_Handler(); }  // 使能CAN接收中断
 
-  // 启动 USART1 接收 (IMU 自动上报, 调度器启动前�????始避�???? ORE 错误)
+  // 启动 USART1 接收 (IMU 自动上报, 调度器启动前�?????始避�????? ORE 错误)
   imu_uart_start_rx();
 
   // 启动 USART6 DMA循环接收 (上位机�?�信)
   HAL_UART_Receive_DMA(&huart6, RxDMA_Buf, RX_BUF_SIZE);
-  // 使能USART6空闲中断 (�??帧数据收完自动触�??)
+  // 使能USART6空闲中断 (�???帧数据收完自动触�???)
   __HAL_UART_ENABLE_IT(&huart6, UART_IT_IDLE);
 
   /* USER CODE END 2 */
