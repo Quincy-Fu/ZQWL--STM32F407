@@ -34,6 +34,7 @@
 #include "move.h"
 #include "goto_pos.h"
 #include "oflow.h"
+#include "pmw3901.h"
 #include "oflow_calib.h"
 #include "xpt2046.h"
 #include "light.h"
@@ -659,6 +660,8 @@ void StartDisplayTask(void const * argument)
     uint8_t ofsen;
     uint8_t tg, homed;
     uint32_t pcnt;
+    uint16_t pmw_shut;
+    uint8_t pmw_led;
 
     __disable_irq();
     ox = g_odom_x;
@@ -674,6 +677,8 @@ void StartDisplayTask(void const * argument)
     ofok = oflow_valid_count;
     ofbad = oflow_invalid_count;
     ofsen = oflow_sensor_ok;
+    pmw_shut = pmw_last_shutter;
+    pmw_led = pmw_led_readback;
     tg = g_target_gear;
     homed = g_pos_homed;
     pcnt = g_pos_cmd_count;
@@ -729,8 +734,10 @@ void StartDisplayTask(void const * argument)
              (double)ofsq, (unsigned long)ofok, (unsigned long)ofbad);
     LCD_Print(4, 160, buf, LCD_GRAY, LCD_BLACK);
 
-    LCD_Print(4, 180, ofsen ? "SENSOR: OK" : "SENSOR: NO",
-              ofsen ? LCD_GREEN : LCD_RED, LCD_BLACK);
+    snprintf(buf, sizeof(buf), "%s SHUT:%u LED:0x%02X",
+             ofsen ? "SENSOR:OK" : "SENSOR:NO",
+             (unsigned)pmw_shut, (unsigned)pmw_led);
+    LCD_Print(4, 180, buf, ofsen ? LCD_GREEN : LCD_RED, LCD_BLACK);
 
     // separator
     LCD_Print(4, 202, "------------------------------", LCD_GRAY, LCD_BLACK);

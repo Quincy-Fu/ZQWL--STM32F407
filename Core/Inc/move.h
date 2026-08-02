@@ -82,7 +82,7 @@ typedef struct {
 #define MOVE_YAW_TURN_TIMEOUT   15000  /* 旋转超时 ms */
 
 /* 电机 */
-#define MOVE_ACC_DEFAULT        30     /* Emm_V5加速度参数 [10→30: 电机更快跟踪减速命令] */
+#define MOVE_ACC_DEFAULT        5      /* Emm_V5加速度参数 [30→5: 旧值致换向6s, Blu3=5] */
 #define MOVE_MOTOR_VEL_LIMIT    5000   /* RPM 上限 */
 #define MOVE_CMD_DELAY_MS       5      /* 电机间CAN发帧间隔 [10→5: 2ms曾丢帧, 5ms=38×帧时间裕量] */
 #define MOVE_READ_TIMEOUT_MS    20     /* S_CPOS回读超时 */
@@ -101,15 +101,16 @@ typedef struct {
 /* Pure Pursuit 路径跟踪 (上位机预插值密集点, MCU端自主前视点跟踪) */
 #define MOVE_PP_MAX_PTS         256    /* 路径点缓冲上限 (256×12B=3KB .bss) */
 #define MOVE_PP_FREE_HEADING    999.0f /* 航向哨兵: 点heading=此值表示自由点(不约束航向) */
-/* 自适应前视: L = clamp(GAIN×R_local, MIN, MAX), R_local=局部曲率半径
- * 切弯公式 r=√(R²-L²): 固定L对紧弯切太多(R=0.5,L=0.25→r=0.43切7cm);
- * 按曲率缩放后, 急弯自动缩短前视约束切弯误差, 直道顶到MAX保平滑 */
-#define MOVE_PP_LOOKAHEAD_GAIN  0.25f  /* 前视距离 = 局部曲率半径 × 此系数 */
-#define MOVE_PP_LOOKAHEAD_MIN   0.08f  /* 前视下限 m (急弯, 防切弯过大) */
-#define MOVE_PP_LOOKAHEAD_MAX   0.25f  /* 前视上限 m (直道/缓弯, 保平滑) */
+/* 速度自适应前视: L = clamp(K×V + L_min, L_min, L_max)
+ * V=当前速度(含减速/软启动). 速度越快前视越远, 低速时L_min保底不塌缩.
+ * @0.30m/s→L=0.30m; @0.02m/s→L=0.16m. 旧曲率方案在车偏离路径时
+ * L<偏移量→前视塌缩到closest→PP退化为向最近点走→命令后退→跑飞. */
+#define MOVE_PP_LA_K           0.5f   /* 速度系数(秒): L = K×V + L_min */
+#define MOVE_PP_LA_MIN         0.15f  /* 最小前视距离 m (蠕变时不塌缩) */
+#define MOVE_PP_LA_MAX         0.40f  /* 最大前视距离 m (封顶防过远) */
 #define MOVE_PP_SPEED           0.30f  /* 默认路径速度 m/s (曲线比直线GOTO慢, 弯更稳) */
 #define MOVE_PP_TOL             0.010f /* 终点到位容差 m */
-#define MOVE_PP_TIMEOUT_MS      60000  /* 路径跟踪超时 ms */
+#define MOVE_PP_TIMEOUT_MS      15000  /* 路径跟踪超时 ms */
 #define MOVE_PP_YAW_LIMIT       0.25f  /* 路径航向通道限幅 m/s [≈84°/s; 航向是主目标,强于HOLD(0.12)弱于TURN(0.35)] */
 
 /* ================================================================

@@ -1076,47 +1076,6 @@ static float pp_interp_angle(float a, float b, float t)
     return pp_norm180(a + d * t);
 }
 
-/* 自适应前视距离: 由closest附近路径点估局部曲率半径, 按曲率缩放前视
- * 三点外接圆半径 R = |AB|·|BC|·|CA| / (2·|cross(B-A,C-A)|)
- * 直线(cross≈0)→R=∞→前视顶到MAX保平滑; 急弯R小→前视缩短约束切弯 */
-static float pp_local_lookahead(const PathPt_t *pts, int n, int closest)
-{
-    const int W = 4;              /* 半窗口: ±4密集点 (2cm间距→±8cm) */
-    int i0 = closest - W;
-    int i2 = closest + W;
-    /* 边界: 窗口整体平移, 尽量保持满宽 (避免起点/终点退化) */
-    if (i0 < 0)     { i2 += -i0;        i0 = 0; }
-    if (i2 > n - 1) { i0 -= i2 - (n-1); i2 = n - 1; }
-    if (i0 < 0) i0 = 0;
-    int i1 = (i0 + i2) / 2;
-    if (i0 == i1 || i1 == i2) return MOVE_PP_LOOKAHEAD_MAX;  /* 点太少 */
-
-    float ax = pts[i0].x, ay = pts[i0].y;
-    float bx = pts[i1].x, by = pts[i1].y;
-    float cx = pts[i2].x, cy = pts[i2].y;
-
-    float abx = bx - ax, aby = by - ay;
-    float bcx = cx - bx, bcy = cy - by;
-    float cax = ax - cx, cay = ay - cy;
-    float ab = move_sqrt(abx * abx + aby * aby);
-    float bc = move_sqrt(bcx * bcx + bcy * bcy);
-    float ca = move_sqrt(cax * cax + cay * cay);
-
-    float cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);  /* 2×面积(带符号) */
-    float area2 = move_abs(cross);
-
-    float L;
-    if (area2 < 1e-6f || ab < 1e-6f || bc < 1e-6f || ca < 1e-6f) {
-        L = MOVE_PP_LOOKAHEAD_MAX;                  /* 近似直线 → 最大前视 */
-    } else {
-        float R = (ab * bc * ca) / (2.0f * area2);  /* 外接圆半径 */
-        L = MOVE_PP_LOOKAHEAD_GAIN * R;
-    }
-    if (L < MOVE_PP_LOOKAHEAD_MIN) L = MOVE_PP_LOOKAHEAD_MIN;
-    if (L > MOVE_PP_LOOKAHEAD_MAX) L = MOVE_PP_LOOKAHEAD_MAX;
-    return L;
-}
-
 /**
  * @brief  Pure Pursuit 路径跟踪 (阻塞式, NavTask调用)
  *
@@ -1188,20 +1147,7 @@ uint8_t MovePathPurePursuit(void)
             return 1;
         }
 
-        /* 4. 自适应前视距离 (按closest处局部曲率缩放: 急弯短/直道长) */
-        float lookahead = pp_local_lookahead(pts, n, closest);
-
-        /* 4b. 前视点: 从closest向前找首个距车>=lookahead的点 */
-        int la = closest;
-        while (la < n - 1) {
-            float lx = pts[la].x - rx, ly = pts[la].y - ry;
-            if (move_sqrt(lx * lx + ly * ly) >= lookahead) break;
-            la++;
-        }
-        /* la==n-1: 前视饱和到末点 (自然收尾) */
-        float tx = pts[la].x, ty = pts[la].y;
-
-        /* 5. 剩余弧长 (closest→末点) → 末端sqrt减速 */
+        /* 4. 先算速度 (软启动 + 末端sqrt减速): L依赖当前速度 */
         float rem = pp_arc_to(pts, n - 1) - pp_arc_to(pts, closest);
         float v_cmd = speed;
         if (rem < MOVE_DECEL_DIST) {
@@ -1210,10 +1156,22 @@ uint8_t MovePathPurePursuit(void)
             if (decel < MOVE_MIN_SPEED) decel = MOVE_MIN_SPEED;
             if (v_cmd > decel) v_cmd = decel;
         }
-        /* 软启动: 前RAMP_TIME_MS线性加速 (减少起步打滑) */
         float ramp = (float)(move_tick() - t0) / (float)MOVE_RAMP_TIME_MS;
         if (ramp > 1.0f) ramp = 1.0f;
         v_cmd *= ramp;
+
+        /* 5. 速度自适应前视距离 L = K×V + L_min, 封顶L_max */
+        float lookahead = MOVE_PP_LA_K * v_cmd + MOVE_PP_LA_MIN;
+        if (lookahead > MOVE_PP_LA_MAX) lookahead = MOVE_PP_LA_MAX;
+
+        /* 5b. 前视点: 从closest向前找首个距车>=lookahead的点 */
+        int la = closest;
+        while (la < n - 1) {
+            float lx = pts[la].x - rx, ly = pts[la].y - ry;
+            if (move_sqrt(lx * lx + ly * ly) >= lookahead) break;
+            la++;
+        }
+        float tx = pts[la].x, ty = pts[la].y;
 
         /* 6. 平移速度: 指向前视点 (场坐标 +X右 +Y前) */
         float dx = tx - rx, dy = ty - ry;
