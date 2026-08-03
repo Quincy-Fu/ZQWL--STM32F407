@@ -39,6 +39,7 @@
 #include "xpt2046.h"
 #include "light.h"
 #include "tim.h"
+#include "move_path_test.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -132,12 +133,12 @@ osMessageQId NavQueueHandle;
 // USART6 mutex: protects concurrent HAL_UART_Transmit between CommTask and NavTask
 osMutexId Uart6MutexHandle;
 
-// �???�??? CubeMX-managed handles that we also reference in USER CODE �???�???
+// �????�???? CubeMX-managed handles that we also reference in USER CODE �????�????
 // These MUST be here (not in CubeMX area) to survive code regeneration.
 osMessageQId DataQueueHandle;
 osThreadId   CommTaskHandle;
 
-// �???�??? Extern declarations for ISR-set global variables �???�???
+// �????�???? Extern declarations for ISR-set global variables �????�????
 // Defined in stm32f4xx_it.c dispatch_frame(), consumed by ServoTask/LightTask.
 // MUST be here (not in CubeMX area) to survive code regeneration.
 extern volatile uint8_t  g_light_pending_id;
@@ -145,7 +146,7 @@ extern volatile uint8_t  g_light_pending_on;
 extern volatile uint8_t  g_light_pending;
 extern volatile uint8_t  g_arm_state;
 
-// 偏心标定诊断 (定义�? oflow_calib.c)
+// 偏心标定诊断 (定义�?? oflow_calib.c)
 extern volatile int32_t  calib_dbg_dx;
 extern volatile int32_t  calib_dbg_dy;
 extern volatile uint8_t  calib_dbg_squal;
@@ -161,6 +162,7 @@ osThreadId DisplayTaskHandle;
 osThreadId ServoTaskHandle;
 osThreadId LightTaskHandle;
 osThreadId PosMotorTaskHandle;
+osThreadId PathTestTaskHandle;
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
@@ -176,9 +178,9 @@ void SendPoseToPC(float x, float y, float theta);
 // NavTask / navigation command execution (Stage 3)
 void StartNavTask(void const * argument);
 void SendNavResultToPC(uint8_t type, uint8_t status);
-void SendPathDebugToPC(float mx, float my, int16_t closest, int16_t la,
+void SendPathDebugToPC(float mx, float my, int16_t wp_idx, int16_t total,
                        float vx_f, float vy_f, float wz, float target_yaw,
-                       uint16_t loop_ms, uint8_t enc_ok);  /* [调试用,定位后删除] */
+                       uint16_t loop_ms, uint8_t enc_ok);  /* [调试�?,定位后删除] */
 
 /* USER CODE END FunctionPrototypes */
 
@@ -191,6 +193,7 @@ void StartDisplayTask(void const * argument);
 void StartServoTask(void const * argument);
 void StartLightTask(void const * argument);
 void StartPosMotorTask(void const * argument);
+void StartTask10(void const * argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -280,6 +283,10 @@ void MX_FREERTOS_Init(void) {
   osThreadDef(PosMotorTask, StartPosMotorTask, osPriorityNormal, 0, 512);
   PosMotorTaskHandle = osThreadCreate(osThread(PosMotorTask), NULL);
 
+  /* definition and creation of PathTestTask */
+  osThreadDef(PathTestTask, StartTask10, osPriorityLow, 0, 512);
+  PathTestTaskHandle = osThreadCreate(osThread(PathTestTask), NULL);
+
   /* USER CODE BEGIN RTOS_THREADS */
   /* definition and creation of CommTask */
   osThreadDef(CommTask, StartCommTask, osPriorityNormal, 0, 256);
@@ -288,6 +295,7 @@ void MX_FREERTOS_Init(void) {
   /* NavTask: executes blocking navigation commands (Stage 3) */
   osThreadDef(NavTask, StartNavTask, osPriorityNormal, 0, 512);
   NavTaskHandle = osThreadCreate(osThread(NavTask), NULL);
+
   /* USER CODE END RTOS_THREADS */
 
 }
@@ -468,9 +476,9 @@ void StartOdomTask(void const * argument)
     if (cur_motor == 0) {
       if (has_last) {
         // Delta sanity check (same as move.c MOVE_ENC_MAX_DELTA=50000):
-        // normal max ~88RPM×65536/60×0.12s ≈ 6900 counts per 120ms cycle.
+        // normal max ~88RPM×65536/60×0.12s �? 6900 counts per 120ms cycle.
         // 50000 = 7x margin. Exceeding it means a read failed in the previous
-        // cycle and last_pos still holds a stale pre-GOTO value → skip
+        // cycle and last_pos still holds a stale pre-GOTO value �? skip
         // integration, just update baseline so next cycle starts fresh.
         int32_t delta[4];
         bool delta_ok = true;
@@ -535,7 +543,7 @@ void StartOptFlowTask(void const * argument)
 {
   /* USER CODE BEGIN StartOptFlowTask */
 
-  // PMW3901 光流处理: 初始化传感器 �???? 10ms 采样 �???? 偏心补偿 �???? 独立里程�????
+  // PMW3901 光流处理: 初始化传感器 �????? 10ms 采样 �????? 偏心补偿 �????? 独立里程�?????
   OFlow_TaskLoop();
 
   /* USER CODE END StartOptFlowTask */
@@ -564,14 +572,14 @@ void StartImuTask(void const * argument)
   imu_uart_set_6axis();
   osDelay(100);  // wait for internal mode switch
 
-  /* 临时: 重新校准陀螺仪零偏 (保持静止, 约7秒)
-   * 校准已完成, 注释掉避免每次开机等7秒 */
+  /* 临时: 重新校准�?螺仪零偏 (保持静止, �?7�?)
+   * 校准已完�?, 注释掉避免每次开机等7�? */
   /* imu_uart_calibrate_imu(); */
   /* osDelay(7000); */
 
-  /* �???�??? �???阶低通滤�???: 平滑IMU噪声, 防止角度环振�??? �???�???
-   * IMU输出25Hz, alpha=0.5 �??? 时间常数�???58ms
-   * 0.2时旋转中滞后0.54°(3.4°/s), 0.5时滞�???0.14°
+  /* �????�???? �????阶低通滤�????: 平滑IMU噪声, 防止角度环振�???? �????�????
+   * IMU输出25Hz, alpha=0.5 �???? 时间常数�????58ms
+   * 0.2时旋转中滞后0.54°(3.4°/s), 0.5时滞�????0.14°
    * 噪声由RotateToTimed 3帧settle兜底 */
   #define IMU_YAW_LPF_ALPHA  0.5f
   float yaw;
@@ -583,7 +591,7 @@ void StartImuTask(void const * argument)
 
     // Get latest yaw -> global (unit: degrees, from imu_protocol.c)
     if (imu_protocol_get_yaw(&yaw)) {
-      /* 低�?�滤�???: filtered = filtered + alpha * (raw - filtered) */
+      /* 低�?�滤�????: filtered = filtered + alpha * (raw - filtered) */
       if (!yaw_filter_init) {
         yaw_filtered = yaw;       /* 首次直接赋�??, 避免启动瞬变 */
         yaw_filter_init = 1;
@@ -652,7 +660,7 @@ void StartDisplayTask(void const * argument)
   char buf[42];
   for(;;)
   {
-    // �????�???? snapshot all shared variables �????�????
+    // �?????�????? snapshot all shared variables �?????�?????
     float ox, oy, iy;
     uint8_t imu_ok, mact;
     float ofx, ofy, ofvx, ofvy, ofsq;
@@ -798,9 +806,9 @@ void StartDisplayTask(void const * argument)
     uint8_t touched = XPT2046_ReadTouch(&tp);
     uint8_t tap = touched && !prev_touched;  // rising edge = new tap
 
-    // �???�??? Page state machine �???�???
+    // �????�???? Page state machine �????�????
     if (page_mode == 0) {
-      // �???�??? MAIN PAGE: 4 touch buttons + settings opener �???�???
+      // �????�???? MAIN PAGE: 4 touch buttons + settings opener �????�????
       LCD_Print(4, 320, "-- TOUCH --", LCD_YELLOW, LCD_BLACK);
 
       if (touched) {
@@ -849,7 +857,7 @@ void StartDisplayTask(void const * argument)
       }
       LCD_Print(160, 410, "[HOME]      ", c3, LCD_BLACK);
 
-      // [SET POSE] button (x=160~310, y=370~400) �??? opens settings page
+      // [SET POSE] button (x=160~310, y=370~400) �???? opens settings page
       uint16_t c4 = LCD_GRAY;
       if (touched && tp.x >= 160 && tp.y >= 370 && tp.y <= 400) {
         c4 = LCD_YELLOW;
@@ -871,7 +879,7 @@ void StartDisplayTask(void const * argument)
       // ══════════════════════════════════════
       LCD_Print(4, 315, "-- SET POSE --", LCD_YELLOW, LCD_BLACK);
 
-      // �???�??? Row 1: X (y=335~360) �???�???
+      // �????�???? Row 1: X (y=335~360) �????�????
       //  [X-]  X: +0.00 M  [X+]
       uint16_t xm_c = LCD_GRAY, xp_c = LCD_GRAY;
       if (touched && tp.x < 70 && tp.y >= 335 && tp.y <= 360) {
@@ -887,7 +895,7 @@ void StartDisplayTask(void const * argument)
       LCD_Print(60, 338, buf, LCD_WHITE, LCD_BLACK);
       LCD_Print(260, 338, "[X+]", xp_c, LCD_BLACK);
 
-      // �???�??? Row 2: Y (y=365~390) �???�???
+      // �????�???? Row 2: Y (y=365~390) �????�????
       uint16_t ym_c = LCD_GRAY, yp_c = LCD_GRAY;
       if (touched && tp.x < 70 && tp.y >= 365 && tp.y <= 390) {
         ym_c = LCD_GREEN;
@@ -902,7 +910,7 @@ void StartDisplayTask(void const * argument)
       LCD_Print(60, 368, buf, LCD_WHITE, LCD_BLACK);
       LCD_Print(260, 368, "[Y+]", yp_c, LCD_BLACK);
 
-      // �???�??? Row 3: YAW (y=395~420) �???�???
+      // �????�???? Row 3: YAW (y=395~420) �????�????
       uint16_t ywm_c = LCD_GRAY, ywp_c = LCD_GRAY;
       if (touched && tp.x < 70 && tp.y >= 395 && tp.y <= 420) {
         ywm_c = LCD_GREEN;
@@ -917,7 +925,7 @@ void StartDisplayTask(void const * argument)
       LCD_Print(60, 398, buf, LCD_WHITE, LCD_BLACK);
       LCD_Print(260, 398, "[A+]", ywp_c, LCD_BLACK);
 
-      // �???�??? Row 4: CONFIRM / CANCEL (y=430~460) �???�???
+      // �????�???? Row 4: CONFIRM / CANCEL (y=430~460) �????�????
       uint16_t cf_c = LCD_GRAY, cc_c = LCD_GRAY;
       if (touched && tp.x < 150 && tp.y >= 430 && tp.y <= 465) {
         cf_c = LCD_GREEN;
@@ -1022,9 +1030,8 @@ void StartServoTask(void const * argument)
 void StartLightTask(void const * argument)
 {
   /* USER CODE BEGIN StartLightTask */
-  // 3 fill lights on TIM3 CH1(PB4) / CH2(PB5) / CH3(PB0), 1kHz PWM
-  Light_Init();
-  Light_SetAll(100);  // fill lights always on for PMW3901 optical flow
+  // PWM already initialized in main.c before FreeRTOS starts.
+  // This task only handles on/off commands from PC (g_light_pending).
 
   for(;;)
   {
@@ -1095,6 +1102,20 @@ void StartPosMotorTask(void const * argument)
   /* USER CODE END StartPosMotorTask */
 }
 
+/* USER CODE BEGIN Header_StartTask10 */
+/**
+* @brief Function implementing the PathTestTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTask10 */
+void StartTask10(void const * argument)
+{
+  /* USER CODE BEGIN StartTask10 */
+  StartPathTestTask(argument);
+  /* USER CODE END StartTask10 */
+}
+
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
 
@@ -1155,9 +1176,30 @@ void StartNavTask(void const * argument)
           break;
 
         case NAV_CMD_PATH:
-          result = MovePathPurePursuit();
+          result = MovePathTrack();
           SendNavResultToPC(TYPE_CMD_PATH_RESP, result);
+          if (g_path_test_active) {
+              g_path_test_last   = result;
+              g_path_test_done  += 1;
+              g_path_test_active = 0;
+          }
           break;
+
+        case NAV_CMD_ARC_TRACK: {
+          float arc_radius  = nav.f[0];
+          float arc_speed   = nav.f[1];
+          int   arc_dir     = (nav.f[2] >= 0.0f) ? 1 : -1;
+          float arc_sweep   = nav.f[3];
+          uint32_t arc_to   = (uint32_t)MOVE_WP_TIMEOUT_MS;
+          result = MoveArcTrack(arc_radius, arc_speed, arc_dir, arc_sweep, arc_to);
+          SendNavResultToPC(TYPE_CMD_PATH_RESP, result);
+          if (g_path_test_active) {
+              g_path_test_last   = result;
+              g_path_test_done  += 1;
+              g_path_test_active = 0;
+          }
+          break;
+        }
 
         case NAV_CMD_CALIB_HEIGHT: {
           /* 挂起OptFlowTask: cal_wait_done直接读PMW3901, 防SPI1竞争 */
@@ -1242,11 +1284,11 @@ void SendNavResultToPC(uint8_t type, uint8_t status)
   }
 }
 
-/* [调试用,定位后删除] Pure Pursuit 内部状态遥测: 每控制周期发一帧到上位机,
- * 用于区分"控制器位置冻结"vs"电机不执行命令"。payload 32字节:
- * move_x(f32)+move_y(f32)+closest(i16)+la(i16)+vx_f(f32)+vy_f(f32)+wz(f32)+target_yaw(f32)
+/* [调试�?,定位后删除] 路径跟踪遥测: 每控制周期发�?帧到上位�?,
+ * 用于区分"控制器位置冻�?"vs"电机不执行命�?"。payload 32字节:
+ * move_x(f32)+move_y(f32)+wp_idx(i16)+total(i16)+vx_f(f32)+vy_f(f32)+wz(f32)+target_yaw(f32)
  * +loop_ms(u16)+enc_ok(u8)+pad(u8) */
-void SendPathDebugToPC(float mx, float my, int16_t closest, int16_t la,
+void SendPathDebugToPC(float mx, float my, int16_t wp_idx, int16_t total,
                        float vx_f, float vy_f, float wz, float target_yaw,
                        uint16_t loop_ms, uint8_t enc_ok)
 {
@@ -1256,8 +1298,8 @@ void SendPathDebugToPC(float mx, float my, int16_t closest, int16_t la,
   buf[3] = 32;                       /* payload len */
   memcpy(&buf[4],  &mx,        4);
   memcpy(&buf[8],  &my,        4);
-  memcpy(&buf[12], &closest,   2);
-  memcpy(&buf[14], &la,        2);
+  memcpy(&buf[12], &wp_idx,    2);
+  memcpy(&buf[14], &total,     2);
   memcpy(&buf[16], &vx_f,      4);
   memcpy(&buf[20], &vy_f,      4);
   memcpy(&buf[24], &wz,        4);

@@ -28,12 +28,17 @@
 #include <stdbool.h>
 
 /* ================================================================
- *  路径点类型 (Pure Pursuit)
+ *  路径点类型 (路径点跟踪器)
  * ================================================================ */
+#define PATH_MODE_NORMAL  0   /* 普通点: 切线跟随(MCU运行时自动算方向) */
+#define PATH_MODE_KEY     1   /* 关键点: 目标姿态角(上位机/任务指定) */
+
 typedef struct {
-    float x;        /* 场坐标 X (右) m */
-    float y;        /* 场坐标 Y (前) m */
-    float heading;  /* 目标航向 ° (CW正); =MOVE_PP_FREE_HEADING 表示自由点(不约束航向) */
+    float   x;            /* 场坐标 X (右) m */
+    float   y;            /* 场坐标 Y (前) m */
+    float   target_theta; /* 目标姿态角 ° (CW+); mode=1时有效, mode=0时不用 */
+    uint8_t mode;         /* 0=普通(切线跟随), 1=关键点(目标姿态) */
+    uint8_t _pad[3];      /* 对齐填充 → 16B/点 */
 } PathPt_t;
 
 /* ================================================================
@@ -84,34 +89,32 @@ typedef struct {
 /* 电机 */
 #define MOVE_ACC_DEFAULT        5      /* Emm_V5加速度参数 [30→5: 旧值致换向6s, Blu3=5] */
 #define MOVE_MOTOR_VEL_LIMIT    5000   /* RPM 上限 */
-#define MOVE_CMD_DELAY_MS       5      /* 电机间CAN发帧间隔 [10→5: 2ms曾丢帧, 5ms=38×帧时间裕量] */
+#define MOVE_CMD_DELAY_MS       3      /* 电机间CAN发帧间隔 [5→3→2→3: 2ms丢帧不稳定,3ms=23×帧时间裕量稳定] */
 #define MOVE_READ_TIMEOUT_MS    20     /* S_CPOS回读超时 */
 #define MOVE_RAMP_TIME_MS       200    /* 软启动时间 ms: 0→满速线性加速, 减少起步打滑 */
 
 /* 控制环 */
-#define MOVE_CTRL_PERIOD_MS     5      /* 控制环周期 ms [30→5: I/O本身~28ms已提供节拍, 末尾延时纯浪费] */
+#define MOVE_CTRL_PERIOD_MS     1      /* 控制环末尾延时 ms [5→1: I/O本身已提供节拍,省4ms/循环] */
 #define MOVE_IMU_TIMEOUT_MS     200    /* IMU通信超时 ms (5×40ms帧间隔, 防接触不良疯转) */
 
 /* 圆弧控制 */
 #define MOVE_ARC_SPEED          0.10f  /* 默认圆弧速度 m/s */
-#define MOVE_ARC_KP_RADIAL      3.0f   /* 径向偏差修正增益 */
+#define MOVE_ARC_KP_RADIAL      5.0f   /* 径向偏差修正增益 [验证甜点: 3.0→5.0(0.6稳),5.0+CMD2丢帧≠振荡,3.5太低不稳→退回5.0] */
 #define MOVE_ARC_TOL            0.010f /* 圆弧完成容差 m */
 #define MOVE_ARC_TIMEOUT_MS     60000  /* 圆弧超时 ms */
+#define MOVE_ARC_DECEL_DEG      15.0f  /* 末端减速区: 剩余角度<此值时线性降速 [GOTO有DECEL_DIST,弧线也需] */
+#define MOVE_ARC_STOP_LATENCY_MS 17    /* 停止延迟ms: CAN停止4×3=12ms+电机响应5ms→预测过冲提前停 */
 
-/* Pure Pursuit 路径跟踪 (上位机预插值密集点, MCU端自主前视点跟踪) */
-#define MOVE_PP_MAX_PTS         256    /* 路径点缓冲上限 (256×12B=3KB .bss) */
-#define MOVE_PP_FREE_HEADING    999.0f /* 航向哨兵: 点heading=此值表示自由点(不约束航向) */
-/* 速度自适应前视: L = clamp(K×V + L_min, L_min, L_max)
- * V=当前速度(含减速/软启动). 速度越快前视越远, 低速时L_min保底不塌缩.
- * @0.30m/s→L=0.30m; @0.02m/s→L=0.16m. 旧曲率方案在车偏离路径时
- * L<偏移量→前视塌缩到closest→PP退化为向最近点走→命令后退→跑飞. */
-#define MOVE_PP_LA_K           0.5f   /* 速度系数(秒): L = K×V + L_min */
-#define MOVE_PP_LA_MIN         0.15f  /* 最小前视距离 m (蠕变时不塌缩) */
-#define MOVE_PP_LA_MAX         0.40f  /* 最大前视距离 m (封顶防过远) */
-#define MOVE_PP_SPEED           0.30f  /* 默认路径速度 m/s (曲线比直线GOTO慢, 弯更稳) */
-#define MOVE_PP_TOL             0.010f /* 终点到位容差 m */
-#define MOVE_PP_TIMEOUT_MS      15000  /* 路径跟踪超时 ms */
-#define MOVE_PP_YAW_LIMIT       0.25f  /* 路径航向通道限幅 m/s [≈84°/s; 航向是主目标,强于HOLD(0.12)弱于TURN(0.35)] */
+/* 路径跟踪 (线段投影 + 横向修正 + 关键点航向) */
+#define MOVE_WP_MAX_PTS         256    /* 路径点缓冲上限 (256×16B=4KB .bss) */
+#define MOVE_WP_END_TOL         0.010f /* 末端到位容差 m */
+#define MOVE_WP_SPEED           0.30f  /* 默认路径速度 m/s */
+#define MOVE_WP_TIMEOUT_MS      15000  /* 路径跟踪超时 ms */
+#define MOVE_WP_LAT_KP          2.0f   /* 横向修正增益 (误差m→修正m/s) */
+#define MOVE_WP_YAW_KP          0.012f /* 航向P增益 (°→m/s轮速差) [验证甜点: 0.012+21ms=0.6稳,降值更差,非振荡] */
+#define MOVE_WP_YAW_MAX         0.30f /* 航向修正限幅 m/s [v/R×L_SUM: v=0.8,R=0.5→0.272, 留余量; 右轮=vy-wz=0.50>0不反转] */
+#define MOVE_WP_KEY_DECEL_DIST  0.15f  /* 关键点减速区 m */
+#define MOVE_WP_KEY_MIN_SPEED   0.10f  /* 关键点最低速度 m/s (给航向环收敛时间) */
 
 /* ================================================================
  *  轴锁定选择
@@ -165,11 +168,23 @@ uint8_t MoveArc(float cx, float cy, float radius,
                 float start_angle_deg, float end_angle_deg,
                 float speed);
 
-/* Pure Pursuit 路径跟踪
- * 上位机预插值密集点 → Move_PathBegin + 多次Move_PathAddPoint 装载 →
- * NavTask调用MovePathPurePursuit阻塞跟踪。航向在约束点间按弧长线性插值。 */
-void    Move_PathBegin(uint8_t count, float speed);          /* ISR: 预告点数+速度, 清零缓冲 */
-void    Move_PathAddPoint(float x, float y, float heading);  /* ISR: 追加一个路径点 */
-uint8_t MovePathPurePursuit(void);                           /* NavTask: 阻塞跟踪, 1=完成 0=超时/中止 */
+/* 圆弧轨迹跟踪 (弧长参数化, 前馈v/R + P反馈)
+ * 从当前位置/航向自动计算圆心, 沿弧线运动sweep_deg度.
+ * 前馈wz=(v/R)×L_SUM消除曲线上稳态滞后, P反馈修正 transient 误差.
+ * 径向P修正保持机器人在弧线上.
+ * dir: +1=CW(右转), -1=CCW(左转)
+ * sweep_deg: 弧度 (180=半圆, 360=整圆)
+ */
+uint8_t MoveArcTrack(float radius, float speed, int dir,
+                     float sweep_deg, uint32_t timeout_ms);
+
+/* 路径跟踪 (线段投影 + 横向修正 + 姿态控制)
+ * 上位机发路径点(x,y,target_theta,mode) → Move_PathBegin + 多次Move_PathAddPoint 装载 →
+ * NavTask调用MovePathTrack阻塞跟踪:
+ *   普通点(mode=0): 位置跟踪 + 切线跟随(方向自动从线段算, wz=Kp×误差)
+ *   关键点(mode=1): 位置跟踪 + 目标姿态(方向=target_theta, 关键点减速) */
+void    Move_PathBegin(uint8_t count, float speed);                      /* ISR: 预告点数+速度, 清零缓冲 */
+void    Move_PathAddPoint(float x, float y, float target_theta, uint8_t mode); /* ISR: 追加一个路径点 */
+uint8_t MovePathTrack(void);                                             /* NavTask: 阻塞跟踪, 1=完成 0=超时/中止 */
 
 #endif /* __MOVE_H */

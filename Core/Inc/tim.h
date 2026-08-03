@@ -37,7 +37,7 @@ extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim3;
 
 /* USER CODE BEGIN Private defines */
-extern TIM_HandleTypeDef htim5;   /* PA3 TIM5_CH4 补光灯4, 1kHz PWM */
+extern TIM_HandleTypeDef htim5;   /* PA3 TIM5_CH4 补光�?4, 1kHz PWM */
 /* USER CODE END Private defines */
 
 void MX_TIM2_Init(void);
@@ -46,7 +46,7 @@ void MX_TIM3_Init(void);
 void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
 
 /* USER CODE BEGIN Prototypes */
-void MX_TIM5_Init(void);   /* USER CODE: PA3 补光灯, 不受 CubeMX 重生成影响 */
+void MX_TIM5_Init(void);   /* USER CODE: PA3 补光�?, 不受 CubeMX 重生成影�? */
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus

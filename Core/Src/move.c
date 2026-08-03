@@ -21,6 +21,9 @@
 #include "task.h"
 #include "cmsis_os.h"
 
+/* 路径测试模块: 前馈开关 (定义在 move_path_test.c) */
+extern volatile uint8_t g_path_test_yaw_ff;
+
 /* ================================================================
  *  全局变量定义
  * ================================================================ */
@@ -37,6 +40,8 @@ volatile int32_t dbg_enc_ok = 0;                     /* 成功读到的轮数 */
 volatile uint8_t dbg_enc_fail = 0;                   /* 最近失败原因: 0=成功 1=超时 2=错地址 3=错功能码 4=错DLC */
 volatile uint32_t dbg_enc_bad_delta = 0;             /* 合理性检查失败次数 (delta超限) */
 volatile int16_t dbg_cmd_rpm[4] = {0, 0, 0, 0};     /* 最近一次发给各电机的RPM命令 */
+volatile uint16_t dbg_loop_ms = 0;                     /* 控制环实际周期 ms (Watch看这个, 正常~28ms) */
+volatile uint8_t g_path_debug_en = 1;                  /* 调试帧开关: 1=开(默认) 0=关(省3ms/循环, Watch设0) */
 
 /* ================================================================
  *  外部引用 (freertos.c / imu_protocol.c)
@@ -46,8 +51,8 @@ extern volatile uint32_t g_imu_last_tick; /* IMU最近一次更新的tick */
 extern volatile float g_odom_x;        /* 里程计X, 同步用 */
 extern volatile float g_odom_y;        /* 里程计Y, 同步用 */
 extern volatile float g_odom_theta;    /* 里程计theta, 同步用 */
-/* [调试用,定位后删除] PP内部状态遥测, 定义在freertos.c */
-extern void SendPathDebugToPC(float mx, float my, int16_t closest, int16_t la,
+/* [调试用,定位后删除] 路径跟踪遥测, 定义在freertos.c */
+extern void SendPathDebugToPC(float mx, float my, int16_t wp_idx, int16_t total,
                               float vx_f, float vy_f, float wz, float target_yaw,
                               uint16_t loop_ms, uint8_t enc_ok);
 
@@ -67,13 +72,13 @@ static bool    enc_has_last = false;
 /* 每轮命令速度 (回读失败时的fallback) */
 static float cmd_wheel_rpm[4] = {0, 0, 0, 0};
 
-/* ── Pure Pursuit 路径缓冲 (ISR装载, NavTask读取) ──
+/* ── 路径点跟踪缓冲 (ISR装载, NavTask读取) ──
  * 装载流程: Move_PathBegin(预告count+speed) → 多次Move_PathAddPoint → EXEC触发执行。
  * 执行期间上位机等待RESP, 不会再发POINT帧, 故无并发写读竞争。 */
-static PathPt_t g_path_pts[MOVE_PP_MAX_PTS];
+static PathPt_t g_path_pts[MOVE_WP_MAX_PTS];
 static volatile uint8_t g_path_count    = 0;   /* 已装载点数 */
 static volatile uint8_t g_path_expected = 0;   /* BEGIN预告的点数 (校验用) */
-static volatile float   g_path_speed    = MOVE_PP_SPEED;
+static volatile float   g_path_speed    = MOVE_WP_SPEED;
 
 /* ================================================================
  *  静态辅助函数
@@ -321,12 +326,12 @@ static void move_update_odom(const int32_t cur_pos[4])
     float sy = move_sin(yaw_deg);
 
     /* 体坐标 → 场坐标 (+X=右, +Y=前, CW正)
-     * 内部dx_body=右移, dy_body=前进
-     * field_X(右) =  dx_body*cos(yaw) + dy_body*sin(yaw)
-     * field_Y(前) = -dx_body*sin(yaw) + dy_body*cos(yaw)
-     */
-    float dX_field = dx_body * cy + dy_body * sy;
-    float dY_field = -dx_body * sy + dy_body * cy;
+     * 这是 Move_SetFieldVelocity 场→体变换的逆矩阵:
+     *   场→体: vx_body =  vx*cos + vy*sin;  vy_body = -vx*sin + vy*cos
+     *   体→场: dX = dx*cos - dy*sin;        dY =  dx*sin + dy*cos  ← sin 取反
+     * 旧代码误用场→体公式做体→场, heading≠0时左右方向搞反→圆弧跑偏 */
+    float dX_field = dx_body * cy - dy_body * sy;
+    float dY_field = dx_body * sy + dy_body * cy;
 
     /* 累加 */
     move_x += dX_field;
@@ -1015,12 +1020,120 @@ uint8_t MoveArc(float cx, float cy, float radius,
 }
 
 /* ================================================================
- *  控制函数 — MovePathPurePursuit (Pure Pursuit 路径跟踪)
+ *  控制函数 — MoveArcTrack (圆弧轨迹跟踪)
  *
- *  上位机预插值密集点 → 装载 → MCU端前视点自主跟踪。
- *  平移通道: 速度向量指向前视点 (全向平移, 无需转向角)。
- *  航向通道: 在约束点(heading!=999)之间按弧长线性插值, 独立控制。
- *  点之间不停车 → 前视点沿路径连续滑动 → 速度连续 → 平滑。
+ *  弧长参数化: θ=s/R, 目标姿态=start_yaw+dir×θ
+ *  前馈: wz_ff=(v/R)×L_SUM → 消除曲线上稳态滞后(无需积分)
+ *  反馈: wz_p=KP×(yaw_err) → 修正 transient 误差
+ *  径向P修正保持机器人在弧线上
+ *  位置算θ(非时间), 速度波动不影响角度精度
+ * ================================================================ */
+
+uint8_t MoveArcTrack(float radius, float speed, int dir,
+                     float sweep_deg, uint32_t timeout_ms)
+{
+    if (radius < 0.01f || speed < 0.01f || dir == 0) return 0;
+
+    g_move_active = 1;
+    enc_has_last = false;
+
+    /* 从当前位置/航向自动计算圆心 */
+    float start_yaw = move_yaw;                 /* CW+ 度 */
+    float cx = move_x + (float)dir * radius * move_cos(start_yaw);
+    float cy = move_y - (float)dir * radius * move_sin(start_yaw);
+
+    /* 初始极角 (标准 atan2, CCW+ 从+X) */
+    float dx0 = move_x - cx, dy0 = move_y - cy;
+    float prev_angle = move_atan2(dy0, dx0);
+
+    float swept = 0.0f;
+    uint32_t t0 = move_tick();
+    uint32_t prev_iter_tick = t0;
+
+    for (;;) {
+        if (move_tick() - t0 >= timeout_ms) {
+            Move_Stop(); move_sync_to_odom(); g_move_active = 0;
+            return 0;
+        }
+        if (move_tick() - g_imu_last_tick > MOVE_IMU_TIMEOUT_MS) {
+            Move_Stop(); move_sync_to_odom(); g_move_active = 0;
+            return 0;
+        }
+
+        /* 读编码器 → 里程计 */
+        int32_t cur_pos[4];
+        dbg_enc_ok = move_read_all_encoders(cur_pos);
+        move_update_odom(cur_pos);
+
+        /* 当前位置相对圆心 */
+        float dx = move_x - cx;
+        float dy = move_y - cy;
+        float r = move_sqrt(dx * dx + dy * dy);
+
+        /* 累计扫过角度 (增量法, 避免 atan2 跳变) */
+        float cur_angle = move_atan2(dy, dx);
+        float delta = cur_angle - prev_angle;
+        while (delta >  180.0f) delta -= 360.0f;
+        while (delta < -180.0f) delta += 360.0f;
+        swept += move_abs(delta);
+        prev_angle = cur_angle;
+
+        /* 完成检查 */
+        if (swept >= sweep_deg) {
+            Move_Stop(); move_sync_to_odom(); g_move_active = 0;
+            return 1;
+        }
+
+        /* 软启动 ramp */
+        float ramp = (float)(move_tick() - t0) / (float)MOVE_RAMP_TIME_MS;
+        if (ramp > 1.0f) ramp = 1.0f;
+        float vf = speed * ramp;
+
+        /* 切线方向: 垂直于半径, 朝运动方向 */
+        float inv_r = (r > 1e-6f) ? (1.0f / r) : 0.0f;
+        float tx =  (float)dir * dy * inv_r;
+        float ty = -(float)dir * dx * inv_r;
+
+        /* 径向修正: 拉回目标半径 */
+        float r_err = r - radius;
+        float radial_spd = r_err * MOVE_ARC_KP_RADIAL;
+        if (radial_spd >  vf) radial_spd =  vf;
+        if (radial_spd < -vf) radial_spd = -vf;
+        float vx_f = vf * tx - radial_spd * dx * inv_r;
+        float vy_f = vf * ty - radial_spd * dy * inv_r;
+
+        /* 航向: 前馈 + P反馈 */
+        float target_yaw = start_yaw + (float)dir * swept;
+        float yaw_err = target_yaw - move_yaw;
+        while (yaw_err >  180.0f) yaw_err -= 360.0f;
+        while (yaw_err < -180.0f) yaw_err += 360.0f;
+
+        float wz_ff = (float)dir * (vf / radius) * MOVE_L_SUM;
+        float wz_p  = yaw_err * MOVE_WP_YAW_KP;
+        float wz = wz_ff + wz_p;
+        if (wz >  MOVE_WP_YAW_MAX) wz =  MOVE_WP_YAW_MAX;
+        if (wz < -MOVE_WP_YAW_MAX) wz = -MOVE_WP_YAW_MAX;
+
+        /* 发送 */
+        uint32_t now_iter = move_tick();
+        uint16_t loop_ms = (uint16_t)(now_iter - prev_iter_tick);
+        dbg_loop_ms = loop_ms;
+        prev_iter_tick = now_iter;
+        if (g_path_debug_en) {
+            SendPathDebugToPC(move_x, move_y, (int16_t)(swept * 10), (int16_t)(sweep_deg * 10),
+                              vx_f, vy_f, wz, target_yaw, loop_ms, dbg_enc_ok);
+        }
+        Move_SetFieldVelocity(vx_f, vy_f, wz);
+        move_sync_to_odom();
+        move_delay(MOVE_CTRL_PERIOD_MS);
+    }
+}
+
+/* ================================================================
+ *  控制函数 — MovePathTrack (路径跟踪)
+ *
+ *  线段投影 + 横向误差修正, 麦轮全向平移, 固定航向。
+ *  不是"到点停下来", 而是"经过这个点继续走"。
  * ================================================================ */
 
 /* 路径缓冲装载 (ISR上下文调用, 仅写全局, 无FreeRTOS调用) */
@@ -1031,94 +1144,99 @@ void Move_PathBegin(uint8_t count, float speed)
     g_path_speed    = speed;
 }
 
-void Move_PathAddPoint(float x, float y, float heading)
+void Move_PathAddPoint(float x, float y, float target_theta, uint8_t mode)
 {
-    if (g_path_count < MOVE_PP_MAX_PTS) {
-        g_path_pts[g_path_count].x       = x;
-        g_path_pts[g_path_count].y       = y;
-        g_path_pts[g_path_count].heading = heading;
+    if (g_path_count < MOVE_WP_MAX_PTS) {
+        g_path_pts[g_path_count].x            = x;
+        g_path_pts[g_path_count].y            = y;
+        g_path_pts[g_path_count].target_theta = target_theta;
+        g_path_pts[g_path_count].mode         = mode;
         g_path_count++;
     }
 }
 
-/* ── Pure Pursuit 静态辅助 ── */
+/* ── 路径跟踪器 ── */
 
-/* 自由航向判定: heading≈999 表示该点不约束航向 */
-static int pp_is_free(float h)
+/* ── 姿态控制器 (独立模块, 可单独测试/替换) ───────────────────
+ * mode=0(普通点): 目标=线段切线方向, 车头沿路径切线转
+ * mode=1(关键点): 目标=任务指定的target_theta, 到位时角度必须准
+ * at_end + mode=0: 已到终点, 无线段可算切线 → wz=0(保持朝向)
+ * at_end + mode=1: 仍需转到target_theta → 继续P控制
+ * 前馈(可选): 仅mode=1有意义, g_path_test_yaw_ff=1开启
+ *
+ * 单位约定: wz输出m/s轮速差(运动学w[i]=vy±vx±wz, 与GOTO/MoveArc一致),
+ *   NOT rad/s. 旧代码输出rad/s被运动学当m/s→值过大→右轮反转→Emm_V5失控.
+ */
+static float path_heading_ctrl(const PathPt_t *p, int seg,
+                               float sdx, float sdy,
+                               float vf, float slen,
+                               int at_end, float yaw)
 {
-    return move_abs(h - MOVE_PP_FREE_HEADING) < 1.0f;
-}
+    /* 普通点 + 到终点: 无线段, 不转 */
+    if (at_end && p[seg+1].mode != PATH_MODE_KEY)
+        return 0.0f;
 
-/* 累计弧长: 路径 pts[0]→pts[k] 的折线长度 m */
-static float pp_arc_to(const PathPt_t *pts, int k)
-{
-    float s = 0.0f;
-    for (int i = 0; i < k; i++) {
-        float dx = pts[i + 1].x - pts[i].x;
-        float dy = pts[i + 1].y - pts[i].y;
-        s += move_sqrt(dx * dx + dy * dy);
+    /* 确定目标姿态角 */
+    float target_yaw;
+    if (p[seg+1].mode == PATH_MODE_KEY) {
+        target_yaw = p[seg+1].target_theta;           /* 任务指定 */
+    } else {
+        target_yaw = atan2f(sdx, sdy) * (180.0f / 3.14159265f);  /* 切线方向 */
     }
-    return s;
-}
 
-/* 角度归一化到 [-180, +180] */
-static float pp_norm180(float a)
-{
-    while (a >  180.0f) a -= 360.0f;
-    while (a < -180.0f) a += 360.0f;
-    return a;
-}
+    /* 姿态误差, 归一化到[-180,+180] */
+    float yaw_err = target_yaw - yaw;
+    while (yaw_err >  180.0f) yaw_err -= 360.0f;
+    while (yaw_err < -180.0f) yaw_err += 360.0f;
 
-/* 最短路径角度插值: 从a到b按比例t∈[0,1] (处理±180跨界) */
-static float pp_interp_angle(float a, float b, float t)
-{
-    float d = pp_norm180(b - a);
-    return pp_norm180(a + d * t);
+    /* P控制: 度×KP = m/s轮速差 (与GOTO/MoveArc同一约定) */
+    float wz = yaw_err * MOVE_WP_YAW_KP;
+
+    /* 角速度前馈: 仅关键点, 可选 (Keil: g_path_test_yaw_ff=1)
+     * dtheta(度)/s × KP = m/s, 与P控制同量纲 */
+    if (g_path_test_yaw_ff && p[seg+1].mode == PATH_MODE_KEY) {
+        float dtheta = p[seg+1].target_theta - p[seg].target_theta;
+        while (dtheta >  180.0f) dtheta -= 360.0f;
+        while (dtheta < -180.0f) dtheta += 360.0f;
+        float omega_deg = (slen > 1e-6f) ? (dtheta * vf / slen) : 0.0f; /* deg/s */
+        wz += omega_deg * MOVE_WP_YAW_KP;  /* 同KP, 保持量纲一致 */
+    }
+
+    if (wz >  MOVE_WP_YAW_MAX) wz =  MOVE_WP_YAW_MAX;
+    if (wz < -MOVE_WP_YAW_MAX) wz = -MOVE_WP_YAW_MAX;
+    return wz;
 }
 
 /**
- * @brief  Pure Pursuit 路径跟踪 (阻塞式, NavTask调用)
+ * @brief  路径跟踪: 线段投影 + 横向修正 + 姿态控制
  *
- * 控制环 (~33ms):
- *   1. 读4轮编码器 → 里程计积分
- *   2. 单调推进 closest = 距车最近的路径点索引
- *   3. 到位判定: closest到末点 且 距末点<=容差 → 完成
- *   4. 前视点 la = 从closest向前首个距车>=lookahead的点 (末端饱和到末点)
- *   5. 剩余弧长 → sqrt末端减速 + 软启动
- *   6. 平移速度 = 指向前视点的单位向量 × 速度 (场坐标 +X右 +Y前)
- *   7. 航向目标 = 约束点间按弧长线性插值
- *   8. 航向P控制 → wz (CW+)
- *   9. Move_SetFieldVelocity 发送
+ *         投影机器人位置到当前线段 → 前进速度沿切线 +
+ *         横向修正∝偏移 → 投影过末端自动切下一段。
+ *         姿态: 普通点跟切线方向, 关键点跟目标姿态角 (path_heading_ctrl).
  *
  * @return 1=完成, 0=超时/IMU失联/装载无效
  */
-uint8_t MovePathPurePursuit(void)
+uint8_t MovePathTrack(void)
 {
     int   n     = (int)g_path_count;
     float speed = g_path_speed;
 
-    /* 装载校验: 至少2点, 且实收==预告 */
-    if (n < 2 || n != (int)g_path_expected) {
-        return 0;
-    }
+    if (n < 2 || n != (int)g_path_expected) return 0;
 
     g_move_active = 1;
-    move_target_yaw = move_yaw;
     enc_has_last = false;
 
-    const PathPt_t *pts = g_path_pts;
-    int closest = 0;                 /* 最近点索引 (单调递增) */
+    const PathPt_t *p = g_path_pts;
+    int seg = 0;                          /* 当前线段: p[seg]→p[seg+1] */
 
     uint32_t t0 = move_tick();
-    uint32_t prev_iter_tick = t0;      /* [调试] 测真实控制环周期 */
+    uint32_t prev_iter_tick = t0;
 
     for (;;) {
-        /* 超时 */
-        if (move_tick() - t0 >= MOVE_PP_TIMEOUT_MS) {
+        if (move_tick() - t0 >= MOVE_WP_TIMEOUT_MS) {
             Move_Stop(); move_sync_to_odom(); g_move_active = 0;
             return 0;
         }
-        /* IMU通信看门狗 */
         if (move_tick() - g_imu_last_tick > MOVE_IMU_TIMEOUT_MS) {
             Move_Stop(); move_sync_to_odom(); g_move_active = 0;
             return 0;
@@ -1128,95 +1246,104 @@ uint8_t MovePathPurePursuit(void)
         int32_t cur_pos[4];
         dbg_enc_ok = move_read_all_encoders(cur_pos);
         move_update_odom(cur_pos);
-
         float rx = move_x, ry = move_y;
 
-        /* 2. 推进closest到距车最近的点 (只前进, 防U形路径回跳) */
-        while (closest < n - 1) {
-            float dcx = pts[closest].x     - rx, dcy = pts[closest].y     - ry;
-            float dnx = pts[closest + 1].x - rx, dny = pts[closest + 1].y - ry;
-            if (dnx * dnx + dny * dny <= dcx * dcx + dcy * dcy) closest++;
-            else break;
+        /* 2. 当前线段向量 + 投影 */
+        float sdx = p[seg+1].x - p[seg].x;
+        float sdy = p[seg+1].y - p[seg].y;
+        float slen2 = sdx * sdx + sdy * sdy;
+
+        /* 退化段(零长度)跳过, 否则t永=0→段切换卡死 */
+        if (slen2 < 1e-8f && seg < n - 2) { seg++; continue; }
+
+        float t = 0.0f;
+        if (slen2 > 1e-8f) {
+            float rxr = rx - p[seg].x, ryr = ry - p[seg].y;
+            t = (rxr * sdx + ryr * sdy) / slen2;  /* [0=起点, 1=终点] */
         }
 
-        /* 3. 终点到位: 最近点已是末点 且 距末点容差内 */
-        float ex = pts[n - 1].x - rx, ey = pts[n - 1].y - ry;
-        float end_dist = move_sqrt(ex * ex + ey * ey);
-        if (closest >= n - 1 && end_dist <= MOVE_PP_TOL) {
-            Move_Stop(); move_sync_to_odom(); g_move_active = 0;
-            return 1;
+        /* 3. 投影超过末端 → 切下一段 (不停车) */
+        if (t >= 1.0f && seg < n - 2) {
+            seg++;
+            continue;
         }
 
-        /* 4. 先算速度 (软启动 + 末端sqrt减速): L依赖当前速度 */
-        float rem = pp_arc_to(pts, n - 1) - pp_arc_to(pts, closest);
-        float v_cmd = speed;
-        if (rem < MOVE_DECEL_DIST) {
-            float ratio = rem / MOVE_DECEL_DIST;
-            float decel = speed * move_sqrt(ratio);
-            if (decel < MOVE_MIN_SPEED) decel = MOVE_MIN_SPEED;
-            if (v_cmd > decel) v_cmd = decel;
+        /* 4. 末段: 投影超过终点 → 朝终点直线收敛 */
+        int at_end = 0;
+        if (seg >= n - 2 && t >= 1.0f) {
+            float exx = p[n-1].x - rx, eyy = p[n-1].y - ry;
+            float dist_end = move_sqrt(exx * exx + eyy * eyy);
+            if (dist_end <= MOVE_WP_END_TOL) {
+                Move_Stop(); move_sync_to_odom(); g_move_active = 0;
+                return 1;
+            }
+            t = 1.0f;      /* 钳位: 横向误差 = 机器人→终点 */
+            at_end = 1;     /* 路径已尽: 停前进, 只靠横向修正收敛 */
         }
+
+        /* 5. 横向误差 = 机器人位置 - 路径上最近点 */
+        float slen   = move_sqrt(slen2);
+        float inv_sl = (slen > 1e-6f) ? (1.0f / slen) : 0.0f;
+        float tx     = sdx * inv_sl;          /* 单位切线 X */
+        float ty     = sdy * inv_sl;          /* 单位切线 Y */
+        float cx     = p[seg].x + t * sdx;    /* 路径上最近点 */
+        float cy     = p[seg].y + t * sdy;
+        float ex     = rx - cx, ey = ry - cy; /* 横向误差向量 */
+        float elen   = move_sqrt(ex * ex + ey * ey);
+
+        /* 6. 前进速度: 沿切线, ramp + 末端sqrt减速 */
         float ramp = (float)(move_tick() - t0) / (float)MOVE_RAMP_TIME_MS;
         if (ramp > 1.0f) ramp = 1.0f;
-        v_cmd *= ramp;
+        float vf = speed * ramp;
 
-        /* 5. 速度自适应前视距离 L = K×V + L_min, 封顶L_max */
-        float lookahead = MOVE_PP_LA_K * v_cmd + MOVE_PP_LA_MIN;
-        if (lookahead > MOVE_PP_LA_MAX) lookahead = MOVE_PP_LA_MAX;
-
-        /* 5b. 前视点: 从closest向前找首个距车>=lookahead的点 */
-        int la = closest;
-        while (la < n - 1) {
-            float lx = pts[la].x - rx, ly = pts[la].y - ry;
-            if (move_sqrt(lx * lx + ly * ly) >= lookahead) break;
-            la++;
-        }
-        float tx = pts[la].x, ty = pts[la].y;
-
-        /* 6. 平移速度: 指向前视点 (场坐标 +X右 +Y前) */
-        float dx = tx - rx, dy = ty - ry;
-        float d  = move_sqrt(dx * dx + dy * dy);
-        float vx_f = 0.0f, vy_f = 0.0f;
-        if (d > 0.001f) {
-            vx_f = (dx / d) * v_cmd;
-            vy_f = (dy / d) * v_cmd;
-        }
-
-        /* 7. 航向目标: 约束点间按弧长线性插值
-         *    pc=closest之前(含)最近约束点, nc=closest之后最近约束点 */
-        float target_yaw = move_yaw;     /* 默认保持当前航向 */
-        int pc = -1, nc = -1;
-        for (int k = closest; k >= 0; k--)     { if (!pp_is_free(pts[k].heading)) { pc = k; break; } }
-        for (int k = closest + 1; k < n; k++)  { if (!pp_is_free(pts[k].heading)) { nc = k; break; } }
-        if (pc >= 0 && nc >= 0) {
-            float sp = pp_arc_to(pts, pc);
-            float sn = pp_arc_to(pts, nc);
-            float sc = pp_arc_to(pts, closest);
-            float frac = (sn > sp) ? (sc - sp) / (sn - sp) : 0.0f;
-            if (frac < 0.0f) frac = 0.0f;
-            if (frac > 1.0f) frac = 1.0f;
-            target_yaw = pp_interp_angle(pts[pc].heading, pts[nc].heading, frac);
-        } else if (pc >= 0) {
-            target_yaw = pts[pc].heading;    /* 末约束点之后: 保持末约束航向 */
-        } else if (nc >= 0) {
-            target_yaw = pts[nc].heading;    /* 首约束点之前: 提前对准首约束航向 */
+        if (!at_end) {
+            float rem = (1.0f - t) * slen;       /* 剩余当前段 */
+            for (int i = seg + 1; i < n - 1; i++) {
+                float dx2 = p[i+1].x - p[i].x, dy2 = p[i+1].y - p[i].y;
+                rem += move_sqrt(dx2 * dx2 + dy2 * dy2);
+            }
+            if (rem < MOVE_DECEL_DIST) {
+                float decel = speed * move_sqrt(rem / MOVE_DECEL_DIST);
+                if (decel < MOVE_MIN_SPEED) decel = MOVE_MIN_SPEED;
+                if (vf > decel) vf = decel;
+            }
+            /* 关键点减速: 接近关键点时降速, 给姿态环收敛时间 */
+            if (p[seg+1].mode == PATH_MODE_KEY) {
+                float d2k = (1.0f - t) * slen;
+                if (d2k < MOVE_WP_KEY_DECEL_DIST) {
+                    float kvf = speed * move_sqrt(d2k / MOVE_WP_KEY_DECEL_DIST);
+                    if (kvf < MOVE_WP_KEY_MIN_SPEED) kvf = MOVE_WP_KEY_MIN_SPEED;
+                    if (vf > kvf) vf = kvf;
+                }
+            }
+        } else {
+            vf = 0.0f;  /* 路径已尽: 停前进, 只靠横向修正收敛到终点 */
         }
 
-        /* 8. 航向P控制 (CW+, 与MoveArc一致直接传SetFieldVelocity) */
-        float yaw_err = pp_norm180(target_yaw - move_yaw);
-        float wz = 0.0f;
-        if (move_abs(yaw_err) > MOVE_YAW_HOLD_DEADZONE) {
-            wz = yaw_err * MOVE_YAW_KP;
-            wz = move_clamp(wz, -MOVE_PP_YAW_LIMIT, MOVE_PP_YAW_LIMIT);
-        }
+        /* 7. 横向修正: ∝误差, 方向指向路径 */
+        float vl = elen * MOVE_WP_LAT_KP;
+        float vl_cap = at_end ? (speed * 0.5f) : (vf * 0.5f);
+        if (vl > vl_cap) vl = vl_cap;
+        float inv_el = (elen > 0.001f) ? (1.0f / elen) : 0.0f;
 
-        /* 9. 发送速度 + 同步里程计 + 控制环延时 */
-        /* [调试用,定位后删除] 遥测内部状态, 区分位置冻结vs电机不听 */
+        float vx_f = vf * tx - vl * ex * inv_el;  /* 前进 + 向路径修正 */
+        float vy_f = vf * ty - vl * ey * inv_el;
+
+        /* 8. 姿态控制 (调用独立函数 path_heading_ctrl) */
+        float wz = path_heading_ctrl(p, seg, sdx, sdy, vf, slen, at_end, move_yaw);
+        float target_yaw = (p[seg+1].mode == PATH_MODE_KEY)
+                           ? p[seg+1].target_theta
+                           : atan2f(sdx, sdy) * (180.0f / 3.14159265f);
+
+        /* 9. 发送 */
         uint32_t now_iter = move_tick();
-        uint16_t loop_ms = (uint16_t)(now_iter - prev_iter_tick);
+        uint16_t loop_ms  = (uint16_t)(now_iter - prev_iter_tick);
+        dbg_loop_ms = loop_ms;
         prev_iter_tick = now_iter;
-        SendPathDebugToPC(move_x, move_y, (int16_t)closest, (int16_t)la,
-                          vx_f, vy_f, wz, target_yaw, loop_ms, dbg_enc_ok);
+        if (g_path_debug_en) {
+            SendPathDebugToPC(move_x, move_y, (int16_t)seg, (int16_t)n,
+                              vx_f, vy_f, wz, target_yaw, loop_ms, dbg_enc_ok);
+        }
         Move_SetFieldVelocity(vx_f, vy_f, wz);
         move_sync_to_odom();
         move_delay(MOVE_CTRL_PERIOD_MS);

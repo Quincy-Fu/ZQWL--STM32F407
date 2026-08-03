@@ -75,7 +75,7 @@ typedef struct {
     uint16_t len;
 } DataPacket_t;
 
-#define RX_BUF_SIZE  256
+#define RX_BUF_SIZE  1024
 
 extern uint8_t RxDMA_Buf[RX_BUF_SIZE];
 extern volatile uint8_t currentHalf;
