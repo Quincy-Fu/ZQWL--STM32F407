@@ -83,6 +83,17 @@
 #define POS_MOVE_VEL_RPM       1000   // slot-to-slot move speed (RPM)
 #define POS_MOVE_ACC           10     // acceleration gear (0 = direct start)
 #define POS_HOME_WAIT_MS       2500   // wait for power-on homing to complete
+/* 响应等待估算 (PosMotorTask 只发不收 CAN, 无真实到位信号, 只能按时间估算):
+ * 1000RPM = 6000°/s 巡航, 单槽 72° 纯巡航仅 ~12ms, 加减速+定位整定为主要开销 */
+#define POS_RESP_BASE_MS       200u   // 基础: 加减速+定位整定开销
+#define POS_RESP_PER_SLOT_MS   150u   // 每槽余量
+/* 舵机缓动参数 (ServoTask 五次多项式插值):
+ * 速度 ≈ 1000/SERVO_MS_PER_DEG, 五次曲线峰值 ≈ 1.875×平均
+ * 8ms/deg 时峰值 ~234°/s 过冲明显, 15ms/deg 峰值 ~125°/s 更稳 */
+#define SERVO_MS_PER_DEG       15u    // 每度耗时(ms), 调大=更慢更平缓
+#define SERVO_MIN_MOVE_MS      200u   // 最短移动时间
+#define SERVO_MAX_MOVE_MS      3000u  // 最长移动时间
+#define SERVO_DEG_TO_CCR(deg)  (500u + (uint32_t)(deg) * 2000u / 270u)  // 角度(0-270°) -> 脉宽(500-2500us)
 
 /* USER CODE END PD */
 
@@ -112,6 +123,7 @@ volatile float g_odom_theta = 0.0f;   // heading (rad), CCW positive
 // Unit: degrees (imu_protocol.c converts raw rad -> deg), CCW positive
 // Zero at power-on heading
 volatile float g_imu_yaw = 0.0f;
+volatile float g_imu_yaw_raw = 0.0f;   /* 无LPF原始值, 弧线swept_imu/停止预测用 (防滤波滞后) */
 volatile uint32_t g_imu_last_tick = 0;   /* xTaskGetTickCount of last yaw update */
 
 // IMU status: 1 = verified OK
@@ -130,6 +142,10 @@ volatile uint8_t  g_pos_homed     = 0;   // 1 = homing completed
 osThreadId NavTaskHandle;
 osMessageQId NavQueueHandle;
 
+// 视觉微调 (Stage 4): NavTask 设速度后非阻塞返回, MotorTask 看门狗超时自动停止
+volatile uint8_t   g_vision_nudge_active = 0;   /* 1=微调进行中(MotorTask看门狗监控) */
+volatile uint32_t g_vision_nudge_tick   = 0;   /* 最近一次微调命令的 tick (xTaskGetTickCount) */
+
 // USART6 mutex: protects concurrent HAL_UART_Transmit between CommTask and NavTask
 osMutexId Uart6MutexHandle;
 
@@ -144,6 +160,9 @@ osThreadId   CommTaskHandle;
 extern volatile uint8_t  g_light_pending_id;
 extern volatile uint8_t  g_light_pending_on;
 extern volatile uint8_t  g_light_pending;
+extern volatile uint8_t  g_rotate_pending_pos;
+extern volatile uint8_t  g_rotate_pending;
+extern volatile uint8_t  g_arm_pending;
 extern volatile uint8_t  g_arm_state;
 
 // 偏心标定诊断 (定义�?? oflow_calib.c)
@@ -367,6 +386,15 @@ void StartTask02(void const * argument)
       g_tgt_vy    = 0.0f;
       g_tgt_omega = 0.0f;
       __enable_irq();
+    }
+
+    // Vision nudge watchdog: 2s 无新微调命令→自动停止+锁死 (防上位机断连失控)
+    if (g_vision_nudge_active && g_move_active) {
+      if ((xTaskGetTickCount() - g_vision_nudge_tick) > pdMS_TO_TICKS(MOVE_VISION_NUDGE_TIMEOUT_MS)) {
+        Move_Stop();
+        g_vision_nudge_active = 0;
+        g_move_active = 0;
+      }
     }
 
     // CMD_VEL convention: vx=right(+), vy=forward(+), w=CW(+)
@@ -600,6 +628,7 @@ void StartImuTask(void const * argument)
       }
       __disable_irq();
       g_imu_yaw = yaw_filtered;
+      g_imu_yaw_raw = yaw;      /* 无LPF, 供弧线停止预测 */
       g_imu_last_tick = xTaskGetTickCount();
       __enable_irq();
     }
@@ -972,47 +1001,95 @@ void StartServoTask(void const * argument)
   // Servo control via TIM2 PWM (50Hz)
   //   Servo 1 = TIM2_CH2 = PA1
   //   Servo 2 = TIM2_CH3 = PA2
-  //   1 count = 1us, servo pulse range: 500-2500us (0-180 deg)
-  //   CCR = 500 + angle_deg * 2000 / 180
+  //   1 count = 1us, servo pulse range: 500-2500us (0-270 deg)
+  //   CCR = 500 + angle_deg * 2000 / 270
   //
-  // ARM command (TYPE_ARM, payload 1B): [state] = 1-8
+  // ARM command (TYPE_ARM, payload 1B): [state] = 0-7 (与上位机统一从0起始)
   // Each state maps to a predefined (servo1, servo2) angle pair.
-  // TODO: fill in actual angles for each state below.
 
-  // State lookup: index 0 = power-on default, 1-8 = arm poses
-  // {servo1_angle, servo2_angle} in degrees (0-180)
-  static const uint8_t arm_poses[9][2] = {
-      { 90,  90},  // [0] power-on default
-      { 90,  90},  // [1] state 1 - TODO
-      { 90,  90},  // [2] state 2 - TODO
-      { 90,  90},  // [3] state 3 - TODO
-      { 90,  90},  // [4] state 4 - TODO
-      { 90,  90},  // [5] state 5 - TODO
-      { 90,  90},  // [6] state 6 - TODO
-      { 90,  90},  // [7] state 7 - TODO
-      { 90,  90},  // [8] state 8 - TODO
+  // State lookup: 0 = power-on default pose, 1-7 = arm poses
+  // {servo1_angle, servo2_angle} in degrees (0-270)
+  static const uint16_t arm_poses[8][2] = {
+      {170,  115},  // [0] power-on default pose
+      {50, 145},  // [1] state 1 - TODO
+      {135, 135},  // [2] state 2 - TODO
+      {135, 135},  // [3] state 3 - TODO
+      {135, 135},  // [4] state 4 - TODO
+      {135, 135},  // [5] state 5 - TODO
+      {135, 135},  // [6] state 6 - TODO
+      {135, 135},  // [7] state 7 - TODO
   };
 
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+  /* 上电第一帧脉宽 = 状态0 目标, 由 arm_poses[0] 运行时计算, 调姿态自动跟随.
+   * 先写 CCR 再开 PWM 输出, 舵机上电直接去状态0, 不绕中位1500;
+   * last_state 从 0 起, 上电不触发多余缓动, 之后状态切换才做缓动. */
+
+  /* 五次多项式缓动: q(t) = 10t^3 - 15t^4 + 6t^5, t∈[0,1]
+   * 两端速度、加速度均为 0, 动作平缓无冲击.
+   * 移动时间 ∝ 两舵机中较大的角度变化 (约125°/s), 钳位在
+   * [SERVO_MIN_MOVE_MS, SERVO_MAX_MOVE_MS].
+   * ARM_RESP 在缓动完成后才回, 语义 = 姿态已到位. */
+  uint8_t  last_state = 0;   // 上电视为已在状态0(与第一帧脉宽一致), 首次 state0 不触发缓动
+  uint32_t cur_ccr1 = SERVO_DEG_TO_CCR(arm_poses[0][0]);   // 当前 CCR = 状态0
+  uint32_t cur_ccr2 = SERVO_DEG_TO_CCR(arm_poses[0][1]);
+  uint32_t src_ccr1 = cur_ccr1, src_ccr2 = cur_ccr2;   // 本次缓动起点
+  uint32_t tgt_ccr1 = cur_ccr1, tgt_ccr2 = cur_ccr2;   // 本次缓动终点
+  uint32_t move_t0 = 0, move_dur = 1;
+  uint8_t  moving = 0;
+
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, cur_ccr1);  // 先写好第一帧脉宽
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, cur_ccr2);
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);                // 再开输出, 不经过中位
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
-
-  // Center both servos at 90 deg on power-on (CCR=1500)
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 1500);
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 1500);
-
-  uint8_t last_state = 0;
 
   for(;;)
   {
     uint8_t state = g_arm_state;
-    if (state >= 1 && state <= 8 && state != last_state) {
-      uint8_t a1 = arm_poses[state][0];
-      uint8_t a2 = arm_poses[state][1];
-      uint32_t ccr1 = 500 + (uint32_t)a1 * 2000 / 180;
-      uint32_t ccr2 = 500 + (uint32_t)a2 * 2000 / 180;
-      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, ccr1);
-      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, ccr2);
+    if (state <= 7 && state != last_state) {
+      uint16_t a1 = arm_poses[state][0];
+      uint16_t a2 = arm_poses[state][1];
+      src_ccr1 = cur_ccr1;   // 从当前位置续动 (中途换姿态也平滑)
+      src_ccr2 = cur_ccr2;
+      tgt_ccr1 = SERVO_DEG_TO_CCR(a1);
+      tgt_ccr2 = SERVO_DEG_TO_CCR(a2);
+
+      uint32_t d1 = (tgt_ccr1 > src_ccr1) ? (tgt_ccr1 - src_ccr1) : (src_ccr1 - tgt_ccr1);
+      uint32_t d2 = (tgt_ccr2 > src_ccr2) ? (tgt_ccr2 - src_ccr2) : (src_ccr2 - tgt_ccr2);
+      uint32_t dmax = (d1 > d2) ? d1 : d2;   // 单位 us, 7.4us = 1deg (2000us/270°)
+
+      if (dmax == 0) {
+        moving = 0;                          // 已在目标位
+      } else {
+        move_dur = (dmax * SERVO_MS_PER_DEG * 270u) / 2000u;  // us -> deg -> ms
+        if (move_dur < SERVO_MIN_MOVE_MS) move_dur = SERVO_MIN_MOVE_MS;
+        if (move_dur > SERVO_MAX_MOVE_MS) move_dur = SERVO_MAX_MOVE_MS;
+        move_t0 = HAL_GetTick();
+        moving = 1;
+      }
       last_state = state;
+    }
+
+    if (moving) {
+      uint32_t el = HAL_GetTick() - move_t0;
+      if (el >= move_dur) {
+        cur_ccr1 = tgt_ccr1;
+        cur_ccr2 = tgt_ccr2;
+        moving = 0;
+      } else {
+        float t = (float)el / (float)move_dur;
+        float q = t * t * t * (t * (6.0f * t - 15.0f) + 10.0f);  // 五次缓动
+        cur_ccr1 = (uint32_t)((int32_t)src_ccr1 +
+                   (int32_t)((float)(int32_t)(tgt_ccr1 - src_ccr1) * q));
+        cur_ccr2 = (uint32_t)((int32_t)src_ccr2 +
+                   (int32_t)((float)(int32_t)(tgt_ccr2 - src_ccr2) * q));
+      }
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, cur_ccr1);
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, cur_ccr2);
+    }
+
+    if (g_arm_pending && !moving) {
+      g_arm_pending = 0;
+      SendNavResultToPC(TYPE_ARM_RESP, 1);   /* 缓动完成, 姿态已到位, 回响应 */
     }
     osDelay(10);
   }
@@ -1044,6 +1121,7 @@ void StartLightTask(void const * argument)
         Light_SetBright(id, bright);
       }
       g_light_pending = 0;
+      SendNavResultToPC(TYPE_LIGHT_RESP, 1);   /* 已执行, 回响应 */
     }
     osDelay(10);
   }
@@ -1064,6 +1142,11 @@ void StartPosMotorTask(void const * argument)
   // Wait for the Emm_V5.0 driver to boot (vendor example ~2s, OdomTask uses 2.5s)
   osDelay(2500);
 
+  // 软件使能: 与轮子电机一致, 每次上电都发, 不依赖面板自锁设置.
+  // 面板自锁可能掉电后丢失; 软件使能确保每次上电都处于使能状态.
+  Emm_V5_En_Control(POS_MOTOR_ADDR, true, false);
+  osDelay(30);
+
   // Trigger single-turn nearest homing: motor returns to the saved origin (= slot 0).
   // The origin must have been set+saved ONCE at install time: align the mechanism
   // to slot 0, then via vendor host PC -> O_Set -> Set O (save). See manual 7.1.
@@ -1080,20 +1163,31 @@ void StartPosMotorTask(void const * argument)
   uint8_t cur_gear = 0;  // after homing the mechanism is at slot 0
 
   for(;;) {
-    uint8_t tgt = g_target_gear;
+    if (g_rotate_pending) {
+      uint8_t tgt = g_rotate_pending_pos;
+      g_rotate_pending = 0;
 
-    if (tgt < POS_SLOT_COUNT && tgt != cur_gear) {
-      // Absolute position move to slot tgt (= tgt * 72 deg from origin).
-      // 13 bytes -> 2 CAN frames via can_SendCmd (with HAL_Delay(10) between frames).
-      // No critical section: motor addr 0x05 differs from OdomTask's 0x01-0x04,
-      // so CAN frame interleaving is harmless.
-      Emm_V5_Pos_Control(POS_MOTOR_ADDR, 0 /*CW*/, POS_MOVE_VEL_RPM, POS_MOVE_ACC,
-                         (uint32_t)tgt * POS_PULSES_PER_SLOT,
-                         true  /*absolute*/,
-                         false /*no sync*/);
-      cur_gear = tgt;
-      g_pos_cmd_count++;
-      osDelay(30);  // post-command cooldown: let motor driver process
+      if (tgt < POS_SLOT_COUNT) {
+        uint8_t delta = (tgt > cur_gear) ? (tgt - cur_gear) : (cur_gear - tgt);
+
+        if (delta > 0) {
+          // Absolute position move to slot tgt (= tgt * 72 deg from origin).
+          // 13 bytes -> 2 CAN frames via can_SendCmd (with HAL_Delay(10) between frames).
+          // No critical section: motor addr 0x05 differs from OdomTask's 0x01-0x04,
+          // so CAN frame interleaving is harmless.
+          Emm_V5_Pos_Control(POS_MOTOR_ADDR, 0 /*CW*/, POS_MOVE_VEL_RPM, POS_MOVE_ACC,
+                             (uint32_t)tgt * POS_PULSES_PER_SLOT,
+                             true  /*absolute*/,
+                             false /*no sync*/);
+          cur_gear = tgt;
+          g_pos_cmd_count++;
+          osDelay(30);  // post-command cooldown: let motor driver process
+          // 估算移动时间后回响应 (无真实到位信号): 基础开销 + 每槽余量
+          osDelay(POS_RESP_BASE_MS + (uint32_t)delta * POS_RESP_PER_SLOT_MS);
+        }
+        /* delta==0: 已在目标槽, 立即回响应 */
+        SendNavResultToPC(TYPE_ROTATE_RESP, 1);
+      }
     }
 
     osDelay(20);
@@ -1169,10 +1263,29 @@ void StartNavTask(void const * argument)
           SendNavResultToPC(TYPE_CMD_SYNC_RESP, 1);
           break;
 
-        case NAV_CMD_ARC:
-          result = MoveArc(nav.f[0], nav.f[1], nav.f[2],
-                           nav.f[3], nav.f[4], MOVE_ARC_SPEED);
+        case NAV_CMD_ARC: {
+          /* 新圆弧语义: 从当前位姿出发, 圆心自动算 (MoveArcTrack).
+           * f[0]=半径m, f[1]=方向(+1右转/-1左转), f[2]=扫过角度°, f[3]=速度(0=默认).
+           * 航向始终沿切线(车头朝前), 软启动+末端减速+IMU停止预测. */
+          float arc_r     = nav.f[0];
+          int   arc_dir   = (nav.f[1] >= 0.0f) ? 1 : -1;
+          float arc_sweep = nav.f[2];
+          if (arc_sweep < 0.0f) arc_sweep = -arc_sweep;
+          float arc_v     = (nav.f[3] > 0.01f) ? nav.f[3] : MOVE_ARC_SPEED;
+          /* 超时按弧长动态计算: 2.5倍裕量 + 15s 基底, 整圆也不会误超时 */
+          uint32_t arc_to = (uint32_t)((arc_sweep * 3.14159265f / 180.0f)
+                              * arc_r / arc_v * 1000.0f * 2.5f) + 15000UL;
+          result = MoveArcTrack(arc_r, arc_v, arc_dir, arc_sweep, arc_to);
           SendNavResultToPC(TYPE_CMD_ARC_RESP, result);
+          break;
+        }
+
+        case NAV_CMD_RUN:
+          /* 模拟启动按键: PD15 默认LOW=未开始, 拉高500ms=按下, 释放回落 */
+          HAL_GPIO_WritePin(GPIOD, GPIO_PIN_15, GPIO_PIN_SET);
+          osDelay(500);
+          HAL_GPIO_WritePin(GPIOD, GPIO_PIN_15, GPIO_PIN_RESET);
+          SendNavResultToPC(TYPE_RUN_RESP, 1);
           break;
 
         case NAV_CMD_PATH:
@@ -1264,11 +1377,40 @@ void StartNavTask(void const * argument)
           break;
         }
 
+        case NAV_CMD_VISION_NUDGE: {
+          /* 视觉微调: 到位后视觉闭环方向微调 (体坐标系, 非阻塞)
+           * dir=0: 立即停止+电磁锁死 (Emm_V5_Stop_Now true)
+           * dir=1-4: 以 MOVE_VISION_NUDGE_SPEED 慢速运动, Emm_V5 维持速度直到收到停止
+           * MotorTask 看门狗: 2s 无新命令自动停止+锁死 */
+          uint8_t dir = (uint8_t)nav.f[0];
+          if (dir == 0) {
+            /* STOP + LOCK */
+            Move_Stop();
+            g_vision_nudge_active = 0;
+          } else {
+            float v = MOVE_VISION_NUDGE_SPEED;
+            float vx = 0.0f, vy = 0.0f;
+            switch (dir) {
+              case 1: vy =  v; break;   /* 前进 (+Y body) */
+              case 2: vy = -v; break;   /* 后退 (-Y body) */
+              case 3: vx = -v; break;   /* 左移 (-X body) */
+              case 4: vx =  v; break;   /* 右移 (+X body) */
+              default: break;
+            }
+            Move_SetRobotVelocity(vx, vy, 0.0f);
+            g_vision_nudge_active = 1;
+            g_vision_nudge_tick   = xTaskGetTickCount();
+          }
+          SendNavResultToPC(TYPE_CMD_VISION_NUDGE_RESP, 1);
+          break;
+        }
+
         default:
           break;
       }
 
-      g_move_active = 0;
+      /* 微调进行中: 保持 g_move_active=1 阻止 MotorTask 覆盖速度; 否则释放 */
+      g_move_active = g_vision_nudge_active ? 1 : 0;
     }
   }
 }
@@ -1328,6 +1470,10 @@ void StartCommTask(void const * argument)
     // g_imu_yaw is in degrees, CCW positive, zero at power-on
     pt = g_imu_yaw * 0.01745329f;  // deg -> rad
     __enable_irq();
+    /* g_imu_yaw 内部刻意不解卷(累加值, 供LPF连续/弧线角度累计),
+     * 上报前必须归一到 [-pi, pi), 否则上位机位姿显示 540/720 累加 */
+    while (pt >  3.14159265f) pt -= 6.28318531f;
+    while (pt < -3.14159265f) pt += 6.28318531f;
     SendPoseToPC(px, py, pt);
     osDelay(20);  // 50Hz
   }

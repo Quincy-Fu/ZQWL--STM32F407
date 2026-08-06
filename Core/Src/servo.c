@@ -7,7 +7,7 @@
  * Servo 1: TIM2_CH2 (PA1)
  * Servo 2: TIM2_CH3 (PA2)
  *
- * Angle input: 0-1800 (0.1 deg units) -> pulse 500-2500 us
+ * Angle input: 0-2700 (0.1 deg units) -> pulse 500-2500 us
  * Easing: f(t) = 6t^5 - 15t^4 + 10t^3  (zero vel & accel at endpoints)
  *
  * Usage:
@@ -73,7 +73,7 @@ void Servo_Init(void)
 /**
  * @brief  Set target angle for a servo (non-blocking, starts easing)
  * @param  servo_id  1 or 2
- * @param  angle_deg10  target angle in 0.1 deg units (0-1800 = 0-180 deg)
+ * @param  angle_deg10  target angle in 0.1 deg units (0-2700 = 0-270 deg)
  *
  * If a previous easing is still running, re-targets from the
  * current actual pulse position so motion stays continuous.

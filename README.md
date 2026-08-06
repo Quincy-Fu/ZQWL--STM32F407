@@ -19,7 +19,7 @@ STM32F407ZGT6 + FreeRTOS + CubeMX，麦轮底盘下位机。
 | USART6 | PC6=TX, PC7=RX | 115200 8N1 | 预留 |
 | SWD | PA13=SWDIO, PA14=SWCLK | — | 调试 |
 
-GPIO: PD9=LCD_CS, PD10=LCD_RST, PD11=LCD_DC, PD12=LCD_LED（开机置高点亮背光）, PE4=PMW3901_CS。
+GPIO: PD9=LCD_CS, PD10=LCD_RST, PD11=LCD_DC, PD12=LCD_LED（开机置高点亮背光）, PE7=PMW3901_CS。
 
 ## 源文件
 
@@ -36,7 +36,7 @@ GPIO: PD9=LCD_CS, PD10=LCD_RST, PD11=LCD_DC, PD12=LCD_LED（开机置高点亮�
 | `spi.h` | SPI1/SPI2 句柄 (`hspi1`, `hspi2`) 和 `MX_SPIx_Init()` |
 | `usart.h` | USART1/USART6 句柄和 `MX_USARTx_UART_Init()` |
 | `gpio.h` | GPIO 初始化声明 |
-| `main.h` | SPI CS 引脚宏 (PE2/PE3/PE4)、`Error_Handler()` |
+| `main.h` | SPI CS 引脚宏 (PE7/PE8/PE9)、`Error_Handler()` |
 | `oflow.h` | 光流处理模块。配置参数 (偏移量/采样周期/squal 阈值)、全局状态变量 (oflow_x/y/vx/vy/squal_avg)、API: `OFlow_TaskLoop` / `OFlow_Reset` / `OFlow_GetPose` |
 | `oflow_calib.h` | 光流标定模块。位置模式参数 (3200脉冲/圈/200RPM)、`OFlowCalibResult_t` 结构体、API: `OFlowCalib_Height` / `OFlowCalib_Offset` / `OFlowCalib_GetPixToM` / `OFlowCalib_SetPixToM` |
 | `FreeRTOSConfig.h` | FreeRTOS 配置 (抢占式/1kHz tick/最大优先级 7/堆 64512B/静态+动态分配) |
@@ -193,7 +193,7 @@ IMU 调试变量（[imu_protocol.c](Core/Src/imu_protocol.c)，Keil 在线看）
 
 ### 硬件
 
-- 传感器: PMW3901MB-TXQT (PixArt 光流, SPI1 Mode 3, PE4 片选, 2.625Mbps)
+- 传感器: PMW3901MB-TXQT (PixArt 光流, SPI1 Mode 3, PE7 片选, 2.625Mbps)
 - 安装方向: X 朝车前, Y 朝车左 (传感器本体丝印)
 - 分辨率: 约 0.00213 m/pixel @ 10cm 高度 (`PMW_RESOLUTION_M = 0.002131946f`)
 

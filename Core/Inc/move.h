@@ -98,12 +98,12 @@ typedef struct {
 #define MOVE_IMU_TIMEOUT_MS     200    /* IMU通信超时 ms (5×40ms帧间隔, 防接触不良疯转) */
 
 /* 圆弧控制 */
-#define MOVE_ARC_SPEED          0.10f  /* 默认圆弧速度 m/s */
+#define MOVE_ARC_SPEED          0.30f  /* 默认圆弧速度 m/s */
 #define MOVE_ARC_KP_RADIAL      5.0f   /* 径向偏差修正增益 [验证甜点: 3.0→5.0(0.6稳),5.0+CMD2丢帧≠振荡,3.5太低不稳→退回5.0] */
 #define MOVE_ARC_TOL            0.010f /* 圆弧完成容差 m */
 #define MOVE_ARC_TIMEOUT_MS     60000  /* 圆弧超时 ms */
-#define MOVE_ARC_DECEL_DEG      15.0f  /* 末端减速区: 剩余角度<此值时线性降速 [GOTO有DECEL_DIST,弧线也需] */
-#define MOVE_ARC_STOP_LATENCY_MS 17    /* 停止延迟ms: CAN停止4×3=12ms+电机响应5ms→预测过冲提前停 */
+#define MOVE_ARC_DECEL_DEG      30.0f  /* 末端减速区: [15→30: 电机实际速度3x命令,需更长减速时间] */
+#define MOVE_ARC_STOP_LATENCY_MS 120   /* 停止延迟ms: 插值最优(100→+1.18°,130→-1.21°,120→≈0°) */
 
 /* 路径跟踪 (线段投影 + 横向修正 + 关键点航向) */
 #define MOVE_WP_MAX_PTS         256    /* 路径点缓冲上限 (256×16B=4KB .bss) */
@@ -115,6 +115,10 @@ typedef struct {
 #define MOVE_WP_YAW_MAX         0.30f /* 航向修正限幅 m/s [v/R×L_SUM: v=0.8,R=0.5→0.272, 留余量; 右轮=vy-wz=0.50>0不反转] */
 #define MOVE_WP_KEY_DECEL_DIST  0.15f  /* 关键点减速区 m */
 #define MOVE_WP_KEY_MIN_SPEED   0.10f  /* 关键点最低速度 m/s (给航向环收敛时间) */
+
+/* 视觉微调 (到位后视觉闭环方向微调, 体坐标系) */
+#define MOVE_VISION_NUDGE_SPEED     0.05f  /* 微调速度 m/s (慢于Blu3 GOTO_CORRECT_SPEED 0.25, 略高于蠕动区0.04, 供视觉闭环跟踪) */
+#define MOVE_VISION_NUDGE_TIMEOUT_MS 2000 /* 微调超时 ms: 无新命令自动停止+锁死 (视觉帧率5-10Hz, 2s=10-20倍裕量) */
 
 /* ================================================================
  *  轴锁定选择

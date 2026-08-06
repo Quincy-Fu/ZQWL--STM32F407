@@ -46,7 +46,8 @@ volatile uint8_t g_path_debug_en = 1;                  /* 调试帧开关: 1=开
 /* ================================================================
  *  外部引用 (freertos.c / imu_protocol.c)
  * ================================================================ */
-extern volatile float g_imu_yaw;       /* IMU偏航角, 度, 上电归零 */
+extern volatile float g_imu_yaw;       /* IMU偏航角, 度, 上电归零 (模块内部融合, 无二次滤波) */
+extern volatile float g_imu_yaw_raw;  /* 无LPF原始yaw(freertos.c定义), swept_imu停止预测用, 防滤波滞后 */
 extern volatile uint32_t g_imu_last_tick; /* IMU最近一次更新的tick */
 extern volatile float g_odom_x;        /* 里程计X, 同步用 */
 extern volatile float g_odom_y;        /* 里程计Y, 同步用 */
@@ -1037,8 +1038,7 @@ uint8_t MoveArcTrack(float radius, float speed, int dir,
     g_move_active = 1;
     enc_has_last = false;
 
-    /* 从当前位置/航向自动计算圆心 */
-    float start_yaw = move_yaw;                 /* CW+ 度 */
+    float start_yaw = -g_imu_yaw;            /* CW+ 度 */
     float cx = move_x + (float)dir * radius * move_cos(start_yaw);
     float cy = move_y - (float)dir * radius * move_sin(start_yaw);
 
@@ -1046,8 +1046,12 @@ uint8_t MoveArcTrack(float radius, float speed, int dir,
     float dx0 = move_x - cx, dy0 = move_y - cy;
     float prev_angle = move_atan2(dy0, dx0);
 
-    float swept = 0.0f;
+    float swept = 0.0f;       /* 编码器位置估算 (切线/径向/航向目标用) */
+    float swept_imu = 0.0f;   /* IMU航向估算 (减速/停止用, 不受打滑影响) */
+    float prev_yaw = -g_imu_yaw_raw;  /* CW+ 累积用 */
+    float yaw_rate_lp = 0.0f;  /* IMU实际角速度 °/s (给停止预测用, 非命令速度) */
     uint32_t t0 = move_tick();
+    uint32_t prev_yaw_tick = t0;
     uint32_t prev_iter_tick = t0;
 
     for (;;) {
@@ -1078,16 +1082,49 @@ uint8_t MoveArcTrack(float radius, float speed, int dir,
         swept += move_abs(delta);
         prev_angle = cur_angle;
 
-        /* 完成检查 */
-        if (swept >= sweep_deg) {
-            Move_Stop(); move_sync_to_odom(); g_move_active = 0;
-            return 1;
-        }
+        /* IMU航向累计 (用于停止判断, 不受打滑影响) */
+        float cur_yaw_raw = -g_imu_yaw_raw;
+        float yaw_delta = cur_yaw_raw - prev_yaw;
+        while (yaw_delta >  180.0f) yaw_delta -= 360.0f;
+        while (yaw_delta < -180.0f) yaw_delta += 360.0f;
+        swept_imu += move_abs(yaw_delta);
+        prev_yaw = cur_yaw_raw;
+
+        /* IMU实际角速度 (停止预测用, 非命令速度) */
+        uint32_t now_yaw_tick = move_tick();
+        float dt_yaw = (now_yaw_tick - prev_yaw_tick) * 0.001f;
+        if (dt_yaw < 0.001f) dt_yaw = 0.001f;
+        float yaw_rate = move_abs(yaw_delta) / dt_yaw;
+        yaw_rate_lp = 0.7f * yaw_rate_lp + 0.3f * yaw_rate;
+        prev_yaw_tick = now_yaw_tick;
 
         /* 软启动 ramp */
         float ramp = (float)(move_tick() - t0) / (float)MOVE_RAMP_TIME_MS;
         if (ramp > 1.0f) ramp = 1.0f;
         float vf = speed * ramp;
+
+        /* 末端减速: 剩余<DECEL_DEG时线性降速到蠕变速度 (IMU swept为准) */
+        float remaining_deg = sweep_deg - swept_imu;
+        if (remaining_deg < MOVE_ARC_DECEL_DEG) {
+            float ratio = remaining_deg / MOVE_ARC_DECEL_DEG;
+            float decel_vf = speed * ratio;
+            if (decel_vf < MOVE_CREEP_SPEED) decel_vf = MOVE_CREEP_SPEED;
+            if (decel_vf < vf) vf = decel_vf;
+        }
+
+        /* 完成检查 + 停止预测: 用IMU实际角速度预测过冲 */
+        float predicted_overshoot = yaw_rate_lp * ((float)MOVE_ARC_STOP_LATENCY_MS / 1000.0f);
+        if (swept_imu + predicted_overshoot >= sweep_deg) {
+            Move_Stop();
+            move_delay(100);  /* 等IMU报新帧 */
+            int32_t final_pos[4];
+            move_read_all_encoders(final_pos);
+            move_update_odom(final_pos);
+            move_yaw = -g_imu_yaw;
+            move_sync_to_odom();
+            g_move_active = 0;
+            return 1;
+        }
 
         /* 切线方向: 垂直于半径, 朝运动方向 */
         float inv_r = (r > 1e-6f) ? (1.0f / r) : 0.0f;

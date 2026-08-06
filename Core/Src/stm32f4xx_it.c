@@ -75,13 +75,24 @@ volatile uint8_t g_light_pending_id = 0;   // 0=all, 1-3=specific light
 volatile uint8_t g_light_pending_on = 0;   // 0=off, 1=on
 volatile uint8_t g_light_pending    = 0;   // 1=new command pending
 
+// ROTATE command pending flag (consumed by PosMotorTask, 执行完回 TYPE_ROTATE_RESP)
+volatile uint8_t g_rotate_pending_pos = 0; // 目标槽位 0-4
+volatile uint8_t g_rotate_pending     = 0; // 1=new command pending
+
+// ARM command pending flag (consumed by ServoTask, 执行完回 TYPE_ARM_RESP)
+volatile uint8_t g_arm_pending = 0;        // 1=new command pending
+
 // ARM servo state (consumed by ServoTask)
 // ARM payload: [state(1B)] = 1 byte
-//   state: 1-8, each maps to a predefined (servo1_angle, servo2_angle) pair
-volatile uint8_t g_arm_state = 0;    // 0=none, 1-8=arm pose state
+//   state: 0-7, each maps to a predefined (servo1_angle, servo2_angle) pair
+//   0 = power-on default pose; 与上位机约定统一: 从0起始
+volatile uint8_t g_arm_state = 0;    // 0=default pose, 1-7=arm pose state
 
 static inline void dispatch_frame(uint8_t type, const uint8_t *payload, uint8_t len)
 {
+    /* 队列在调度器启动后才创建; 上电早期若已收到帧, 直接丢弃防 NULL 句柄 */
+    if (!NavQueueHandle || !DataQueueHandle) return;
+
     if (type == TYPE_CMD_VEL && len == PAYLOAD_SIZE_VEL) {
         DataPacket_t pkt;
         pkt.len = 12;
@@ -92,23 +103,33 @@ static inline void dispatch_frame(uint8_t type, const uint8_t *payload, uint8_t 
         g_rx_cmd_vel_count++;
     } else if (type == TYPE_ROTATE && len >= 1) {
         uint8_t pos = payload[0];
-        if (pos < 5) g_target_gear = pos;
+        if (pos < 5) {
+            g_target_gear = pos;          /* LCD 显示用 */
+            g_rotate_pending_pos = pos;   /* PosMotorTask 执行+回响应 */
+            g_rotate_pending = 1;
+        }
         g_rx_rotate_count++;
     } else if (type == TYPE_ARM) {
         if (len >= 1) {
             uint8_t state = payload[0];
-            if (state >= 1 && state <= 8) {
+            if (state <= 7) {          /* 0-7, 与上位机统一从0起始 */
                 g_arm_state = state;
+                g_arm_pending = 1;     /* ServoTask 执行+回响应 */
             }
         }
         g_rx_arm_count++;
     } else if (type == TYPE_LIGHT) {
         if (len >= 2) {
-            g_light_pending_id = payload[0];  // 0=all, 1-3=specific
+            g_light_pending_id = payload[0];  // 0=all, 1-4=specific (4=PA3/TIM5)
             g_light_pending_on = payload[1];  // 0=off, nonzero=on
             g_light_pending = 1;
         }
         g_rx_light_count++;
+    } else if (type == TYPE_RUN && len == 0) {
+        NavPacket_t nav; nav.cmd = NAV_CMD_RUN;
+        BaseType_t h = pdFALSE;
+        xQueueSendFromISR(NavQueueHandle, &nav, &h);
+        portYIELD_FROM_ISR(h);
     }
     // --- Navigation commands -> NavQueue (Stage 3) ---
     else if (type == TYPE_CMD_GOTO && len == 8) {
@@ -162,13 +183,15 @@ static inline void dispatch_frame(uint8_t type, const uint8_t *payload, uint8_t 
         portYIELD_FROM_ISR(h);
         g_rx_nav_count++;
     }
-    else if (type == TYPE_CMD_ARC && len == 20) {
+    else if (type == TYPE_CMD_ARC && (len == 12 || len == 16)) {
+        /* 新圆弧语义: f[0]=半径m, f[1]=方向(+1右转/-1左转), f[2]=扫过角度°,
+         * f[3]=速度m/s(可选, 12B帧时由NavTask用默认速度). 圆心由下位机按当前位姿自动算. */
         NavPacket_t nav; nav.cmd = NAV_CMD_ARC;
+        nav.f[0] = 0.0f; nav.f[1] = 0.0f; nav.f[2] = 0.0f; nav.f[3] = 0.0f;
         memcpy(&nav.f[0], payload, 4);
         memcpy(&nav.f[1], payload + 4, 4);
         memcpy(&nav.f[2], payload + 8, 4);
-        memcpy(&nav.f[3], payload + 12, 4);
-        memcpy(&nav.f[4], payload + 16, 4);
+        if (len == 16) memcpy(&nav.f[3], payload + 12, 4);
         BaseType_t h = pdFALSE;
         xQueueSendFromISR(NavQueueHandle, &nav, &h);
         portYIELD_FROM_ISR(h);
@@ -190,11 +213,11 @@ static inline void dispatch_frame(uint8_t type, const uint8_t *payload, uint8_t 
         portYIELD_FROM_ISR(h);
         g_rx_nav_count++;
     }
-    // --- 路径点跟�? ---
+    // --- 路径点跟�?? ---
     else if (type == TYPE_CMD_PATH_BEGIN && len == 5) {
         float speed; memcpy(&speed, payload, 4);
         uint8_t count = payload[4];
-        Move_PathBegin(count, speed);   /* 仅写全局缓冲, 不入�? */
+        Move_PathBegin(count, speed);   /* 仅写全局缓冲, 不入�?? */
         g_rx_nav_count++;
     }
     else if (type == TYPE_CMD_PATH_POINT && len == 16) {
@@ -203,11 +226,20 @@ static inline void dispatch_frame(uint8_t type, const uint8_t *payload, uint8_t 
         memcpy(&y,            payload + 4,  4);
         memcpy(&target_theta, payload + 8,  4);
         uint8_t mode = payload[12];
-        Move_PathAddPoint(x, y, target_theta, mode);  /* 追加到全�?缓冲, 不入�? */
+        Move_PathAddPoint(x, y, target_theta, mode);  /* 追加到全�??缓冲, 不入�?? */
         g_rx_nav_count++;
     }
     else if (type == TYPE_CMD_PATH_EXEC) {
         NavPacket_t nav; nav.cmd = NAV_CMD_PATH;
+        BaseType_t h = pdFALSE;
+        xQueueSendFromISR(NavQueueHandle, &nav, &h);
+        portYIELD_FROM_ISR(h);
+        g_rx_nav_count++;
+    }
+    // --- 视觉微调 (Stage 4) ---
+    else if (type == TYPE_CMD_VISION_NUDGE && len == 1) {
+        NavPacket_t nav; nav.cmd = NAV_CMD_VISION_NUDGE;
+        nav.f[0] = (float)payload[0];   /* direction: 0=stop+lock, 1=fwd, 2=back, 3=left, 4=right */
         BaseType_t h = pdFALSE;
         xQueueSendFromISR(NavQueueHandle, &nav, &h);
         portYIELD_FROM_ISR(h);
@@ -337,10 +369,10 @@ void CAN1_RX0_IRQHandler(void)
    * Old code only read 1 frame per ISR; remaining frames get stuck
    * because the FIFO pending interrupt doesn't re-fire.
    *
-   * Snapshot fix: 每次 GetRxMessage 后保存完整帧�??? rxSnap/rxSnapData.
-   * move.c / OdomTask 从快照读�???, 避免共享 rxData 被后续帧覆盖
-   * 导致部分读取 (符号字节被篡�??? �??? 编码器符号翻�??? �??? 里程计爆�???).
-   * drain循环中多次覆盖快�???, �???终保留最后一�??? �??? 这是�???佳可用帧. */
+   * Snapshot fix: 每次 GetRxMessage 后保存完整帧�???? rxSnap/rxSnapData.
+   * move.c / OdomTask 从快照读�????, 避免共享 rxData 被后续帧覆盖
+   * 导致部分读取 (符号字节被篡�???? �???? 编码器符号翻�???? �???? 里程计爆�????).
+   * drain循环中多次覆盖快�????, �????终保留最后一�???? �???? 这是�????佳可用帧. */
   while(HAL_CAN_GetRxFifoFillLevel(&hcan1, CAN_RX_FIFO0) > 0)
   {
     if(HAL_CAN_GetRxMessage(&hcan1, CAN_RX_FIFO0, (CAN_RxHeaderTypeDef *)(&can.CAN_RxMsg), (uint8_t *)(&can.rxData)) == HAL_OK)
@@ -416,11 +448,11 @@ void USART6_IRQHandler(void)
   if (__HAL_UART_GET_FLAG(&huart6, UART_FLAG_IDLE) != RESET) {
     __HAL_UART_CLEAR_IDLEFLAG(&huart6);
 
-    // 计算DMA当前写位�??????
+    // 计算DMA当前写位�???????
     uint16_t write_pos = RX_BUF_SIZE
         - __HAL_DMA_GET_COUNTER(&hdma_usart6_rx);
 
-    // 处理新字�??????
+    // 处理新字�???????
     if (write_pos != dma_read_pos) {
       if (write_pos > dma_read_pos) {
         for (uint16_t i = dma_read_pos; i < write_pos; i++) {
@@ -431,7 +463,7 @@ void USART6_IRQHandler(void)
           }
         }
       } else {
-        // 缓冲区回�?????? (CIRCULAR模式或NORMAL重启�??????)
+        // 缓冲区回�??????? (CIRCULAR模式或NORMAL重启�???????)
         for (uint16_t i = dma_read_pos; i < RX_BUF_SIZE; i++) {
           uint8_t out_type, out_payload[64], out_len;
           if (UartParser_FeedByte(&uart6_parser, RxDMA_Buf[i],
@@ -450,7 +482,7 @@ void USART6_IRQHandler(void)
       dma_read_pos = write_pos;
     }
 
-    // DMA NORMAL模式: 缓冲区满后DMA停止, �??????要重�??????
+    // DMA NORMAL模式: 缓冲区满后DMA停止, �???????要重�???????
     if (huart6.RxState == HAL_UART_STATE_READY) {
       dma_read_pos = 0;
       HAL_UART_Receive_DMA(&huart6, RxDMA_Buf, RX_BUF_SIZE);

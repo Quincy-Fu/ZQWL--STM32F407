@@ -80,7 +80,8 @@ void MX_TIM2_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN TIM2_Init 2 */
-
+  /* 舵机上电第一帧脉宽不在这里设死: 由 freertos.c ServoTask 在开 PWM 前
+   * 按 arm_poses[0] 现算写入 (姿态调参自动跟随), 不经过中位1500. */
   /* USER CODE END TIM2_Init 2 */
   HAL_TIM_MspPostInit(&htim2);
 
@@ -254,9 +255,9 @@ void HAL_TIM_Base_MspDeInit(TIM_HandleTypeDef* tim_baseHandle)
 
 /* USER CODE BEGIN 1 */
 
-/* PA3 = TIM5_CH4 (AF2), 1kHz PWM, 补光�?4
- * �? TIM3 相同参数: 84MHz / 84 / 1000 = 1kHz, ARR=999 �? 0.1% 分辨�?
- * 放在 USER CODE �?, CubeMX 重生成不覆盖 */
+/* PA3 = TIM5_CH4 (AF2), 1kHz PWM, 补光�?4
+ * �? TIM3 相同参数: 84MHz / 84 / 1000 = 1kHz, ARR=999 �? 0.1% 分辨�?
+ * 放在 USER CODE �?, CubeMX 重生成不覆盖 */
 TIM_HandleTypeDef htim5;
 
 void MX_TIM5_Init(void)
@@ -264,7 +265,7 @@ void MX_TIM5_Init(void)
     __HAL_RCC_TIM5_CLK_ENABLE();
     __HAL_RCC_GPIOA_CLK_ENABLE();
 
-    /* PA3 �? TIM5_CH4, AF2 */
+    /* PA3 �? TIM5_CH4, AF2 */
     GPIO_InitTypeDef gpio = {0};
     gpio.Pin       = GPIO_PIN_3;
     gpio.Mode      = GPIO_MODE_AF_PP;

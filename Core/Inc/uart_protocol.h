@@ -14,6 +14,11 @@
 #define TYPE_ROTATE              0x03
 #define TYPE_ARM                 0x04
 #define TYPE_LIGHT               0x05
+#define TYPE_RUN                 0x06   // PC->MCU: 启动(模拟按键PD15), payload 空
+#define TYPE_RUN_RESP            0x07   // MCU->PC: 启动响应, payload 1B status
+#define TYPE_ROTATE_RESP         0x08   // MCU->PC: 转盘响应(估算移动时间后), payload 1B status
+#define TYPE_ARM_RESP            0x09   // MCU->PC: 机械臂响应, payload 1B status
+#define TYPE_LIGHT_RESP          0x0A   // MCU->PC: 补光灯响应, payload 1B status
 
 // Navigation command types (Stage 3)
 // Even = command (PC->MCU), Odd = response (MCU->PC)
@@ -41,6 +46,10 @@
 #define TYPE_CMD_PATH_EXEC      0x24   // payload: 空, 触发执行
 #define TYPE_CMD_PATH_RESP      0x25   // payload: result(u8) 1=完成 0=超时/中止
 #define TYPE_CMD_PATH_DEBUG     0x26   // [调试用,定位后删除] MCU→PC: move_x/y+wp_idx+total+vx_f/vy_f+wz+target_yaw
+
+// 视觉微调 (Stage 4: 到位后视觉闭环方向微调)
+#define TYPE_CMD_VISION_NUDGE        0x27   // PC->MCU: payload 1B direction (0=stop+lock, 1=fwd, 2=back, 3=left, 4=right)
+#define TYPE_CMD_VISION_NUDGE_RESP   0x28   // MCU->PC: payload 1B status (1=executed)
 
 // ????payload?? (3?float)
 #define PAYLOAD_SIZE_VEL         12
@@ -89,12 +98,14 @@ bool UartParser_FeedByte(UartParser_t* parser, uint8_t byte, uint8_t* out_type, 
 #define NAV_CMD_TURNTO     0x04
 #define NAV_CMD_FINE_MOVE  0x05
 #define NAV_CMD_SYNC_POSE  0x06
-#define NAV_CMD_ARC        0x07
+#define NAV_CMD_ARC        0x07   /* 圆弧(MoveArcTrack): f[0]=半径m, f[1]=方向(+1右/-1左), f[2]=扫过角度°, f[3]=速度(0=默认) */
 #define NAV_CMD_CALIB_HEIGHT 0x08
 #define NAV_CMD_CALIB_OFFSET 0x09
 #define NAV_CMD_PATH       0x0A
 #define NAV_CMD_PATH_TEST  0x0B   /* 内置路径测试 (无线调试器触发, 实际走 NAV_CMD_PATH) */
 #define NAV_CMD_ARC_TRACK  0x0C   /* 圆弧轨迹跟踪: f[0]=radius, f[1]=speed, f[2]=dir(±1), f[3]=sweep_deg */
+#define NAV_CMD_RUN        0x0D   /* 启动按键模拟: PD15 脉冲500ms, 无参数, 回复 TYPE_RUN_RESP */
+#define NAV_CMD_VISION_NUDGE 0x0E  /* 视觉微调: f[0]=direction(0=stop+lock,1=fwd,2=back,3=left,4=right) */
 
 typedef struct {
     uint8_t  cmd;

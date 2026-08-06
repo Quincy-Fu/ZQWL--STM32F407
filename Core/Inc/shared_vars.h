@@ -18,7 +18,8 @@
  * ================================================================ */
 
 /* IMU 航向 (度, CCW 正, 上电=0°) */
-extern volatile float g_imu_yaw;
+extern volatile float g_imu_yaw;       /* LPF滤波后, 给航向控制/里程计用 */
+extern volatile float g_imu_yaw_raw;  /* 无LPF, 给弧线swept_imu用 */
 extern volatile uint8_t g_imu_verified;
 
 /* 里程计 (场坐标: x=右m, y=前m, theta=CCW rad) */

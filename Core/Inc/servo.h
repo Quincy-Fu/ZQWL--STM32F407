@@ -13,9 +13,8 @@
 #define SERVO_PULSE_MIN   500
 #define SERVO_PULSE_MAX   2500
 
-/* ---- Angle range (0.1 deg units): 0-1800 = 0.0-180.0 deg ---- */
-/* Change to 2700 if your servos are 270-degree type */
-#define SERVO_ANGLE_MAX   1800
+/* ---- Angle range (0.1 deg units): 0-2700 = 0.0-270.0 deg ---- */
+#define SERVO_ANGLE_MAX   2700
 
 /* ---- Quintic easing parameters ---- */
 #define SERVO_EASE_MS_PER_US  0.5f   /* ms per us pulse diff (full range ~1s) */
