@@ -1,6 +1,10 @@
 /**
  * @file    oflow_calib.c
  * @brief   光流标定模块 — 高度标定 + 偏心偏移标定实现
+ *
+ * 当前状态: 已停用 (oflow.h 中 OFLOW_ENABLE = 0).
+ * 代码保留完整可编译; 启用光流后, 可经上位机标定命令或
+ * Keil 调试器直接调用本模块函数. 不控制补光灯 (与 light 模块解耦).
  */
 
 #include "oflow_calib.h"
@@ -8,7 +12,6 @@
 #include "pmw3901.h"
 #include "move.h"
 #include "Emm_V5.h"
-#include "light.h"
 #include "shared_vars.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -105,9 +108,6 @@ uint8_t OFlowCalib_Height(uint8_t axis, float num_revolutions,
 {
     if (!oflow_sensor_ok || num_revolutions <= 0.0f) return 0;
 
-    /* 补光灯全亮 (可见光, 给摄像头用; PMW3901 需 IR 照明, 此灯对它无效) */
-    Light_SetAll(100);
-
     /* 挂起 OptFlowTask: 它会读 PMW3901 并清零 delta 寄存器,
      * 与 cal_wait_done 竞争, 导致像素被偷 + 提前判定停止 */
     if (OptFlowTaskHandle) vTaskSuspend(OptFlowTaskHandle);
@@ -198,8 +198,6 @@ uint8_t OFlowCalib_Height(uint8_t axis, float num_revolutions,
 uint8_t OFlowCalib_Offset(float *offset_x_out, float *offset_y_out)
 {
     if (!oflow_sensor_ok) return 0;
-
-    Light_SetAll(100);  /* 可见光补光, 对 PMW3901 无效但给摄像头用 */
 
     if (OptFlowTaskHandle) vTaskSuspend(OptFlowTaskHandle);
     PMW_CS_HIGH();

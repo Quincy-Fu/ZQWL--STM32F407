@@ -9,6 +9,7 @@
 static volatile uint8_t  s_rx_buf[IMU_RX_BUF_SIZE];
 static volatile uint16_t s_rx_write = 0;
 static volatile uint16_t s_rx_read  = 0;
+static volatile uint8_t  s_parser_reset_pending = 0;
 
 /* 解析状态机 */
 enum {
@@ -37,6 +38,7 @@ volatile uint32_t imu_frame_count       = 0;
 volatile uint8_t  imu_last_checksum_ok  = 0;
 volatile uint32_t imu_rx_byte_count     = 0;   // total bytes received (debug)
 volatile float    imu_raw_yaw           = 0.0f; // raw yaw before conversion (debug)
+volatile uint32_t imu_return_state_count = 0;  // valid RETURN_STATE frames from IMU commands
 
 /* ---- 环形缓冲接口 ---- */
 
@@ -110,6 +112,14 @@ void imu_protocol_process(void)
     static uint8_t frame_buf[64];
     static uint8_t frame_idx = 0;
 
+    if (s_parser_reset_pending) {
+        state = RX_HEAD1;
+        frame_len = 0;
+        frame_func = 0;
+        frame_idx = 0;
+        s_parser_reset_pending = 0;
+    }
+
     uint8_t b;
     while (s_rx_pop(&b) == 0) {
         switch (state) {
@@ -148,6 +158,9 @@ void imu_protocol_process(void)
 
                     imu_last_func = frame_func;
                     if (calc == recv) {
+                        if (frame_func == IMU_FUNC_RETURN_STATE) {
+                            imu_return_state_count++;
+                        }
                         parse_frame(frame_func, frame_buf, (uint8_t)(data_len - 1));
                         imu_last_checksum_ok = 1;
                         imu_frame_count++;
@@ -169,4 +182,15 @@ bool imu_protocol_get_yaw(float *out)
     if (!out) return false;
     *out = s_yaw;
     return true;
+}
+
+void imu_protocol_reset_yaw_zero(void)
+{
+    s_rx_read = s_rx_write;      /* discard stale frames captured before/during calibration */
+    s_parser_reset_pending = 1;
+    s_yaw = 0.0f;
+    s_yaw_zeroed = 0;
+    s_yaw_offset = 0.0f;
+    s_yaw_prev_raw = 0.0f;
+    s_yaw_unwrapped = 0.0f;
 }

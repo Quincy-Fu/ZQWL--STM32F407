@@ -5,7 +5,7 @@
  * 提供：位置控制(MoveTo)、轴锁定(MoveToAxisLock)、原地旋转(RotateTo)、
  *       圆弧跟踪(MoveArc)、里程计积分、急停。
  *
- * 控制环30ms周期：P环位置控制 + 编码器回读里程计 + IMU航向保持。
+ * 控制环30ms周期：P环位置控制 + 编码器回读XY/航向里程计。
  * 单位：米(m)、米/秒(m/s)、度(deg)。
  *
  * 坐标系 (与Blu3场坐标一致):
@@ -16,8 +16,8 @@
  *
  * 内部实现:
  *   运动学/电机层使用Blu3体坐标(dy=前进, dx=右移, CW正),
- *   IMU(g_imu_yaw)是CCW正.
- *   场坐标边界做yaw符号映射: 外部θ(CW)=-内部θ(CCW).
+ *   全程使用编码器yaw; IMU仅保留诊断/校准, 不参与运动角度闭环.
+ *   场坐标计算内部仍用数学CCW正, 入口处由move_yaw转换.
  *   X(右)/Y(前)与Blu3场坐标dx(右)/dy(前)方向一致, 无需取反.
  */
 
@@ -46,9 +46,11 @@ typedef struct {
  * ================================================================ */
 #define MOVE_WHEEL_D        0.065f     /* 轮径 m */
 #define MOVE_WHEEL_R        (MOVE_WHEEL_D * 0.5f)
-#define MOVE_HALF_WB        0.085f     /* 半轮距(前后) m */
-#define MOVE_HALF_TW        0.085f     /* 半轮距(左右) m */
-#define MOVE_L_SUM          (MOVE_HALF_WB + MOVE_HALF_TW)  /* = 0.170 */
+#define MOVE_HALF_WB        0.085f     /* 半轴距(前后) m: 实测85mm */
+#define MOVE_HALF_TW        0.083f     /* 半轮距(左右) m: 轮距微调为83mm */
+#define MOVE_L_SUM          (MOVE_HALF_WB + MOVE_HALF_TW)  /* = 0.168 */
+#define MOVE_YAW_L_SUM      MOVE_L_SUM /* 普通移动/原地旋转yaw有效L_SUM: 使用物理168mm */
+#define MOVE_ARC_YAW_L_SUM  0.164f     /* 圆弧段yaw有效L_SUM: 标定测试值164mm */
 
 /* ================================================================
  *  单位换算
@@ -66,24 +68,28 @@ typedef struct {
  *  控制参数 (实车标定)
  * ================================================================ */
 #define MOVE_POS_KP             2.0f   /* 位置误差(m) → 速度(m/s) [KP=3.0震荡过冲,退回] */
-#define MOVE_POS_KD             2.0f   /* 超速阻尼增益 [仅作用于v_actual-P命令的超速量, 不影响正常巡航] */
+#define MOVE_POS_KD             3.0f   /* 超速阻尼增益 [加重后过冲, 从2.0→3.0增强刹车] */
 #define MOVE_MIN_SPEED          0.02f  /* 最低运动速度 m/s (克服静摩擦) */
 #define MOVE_MAX_SPEED          0.8f   /* 默认最大移动速度 m/s [0.7→0.8: 配合0.70巡航, 留余量] */
 #define MOVE_DEFAULT_TOL        0.005f /* 默认到位容差 m (5mm) */
 #define MOVE_STOP_LATENCY_S     0.025f /* 停止延迟 s (CAN急停20ms+电机响应5ms), 预测制动用 */
 #define MOVE_DEFAULT_TIMEOUT_MS 30000  /* 默认移动超时 ms */
-#define MOVE_DECEL_DIST         1.20f  /* 减速区距离 m [1.00→1.20: a=0.204, 回到验证值~0.21附近, 电机跟踪极限] */
+#define MOVE_DECEL_DIST         1.60f  /* 减速区距离 m [1.20→1.60: 加重后惯性大, 给更长刹车距离, a≈0.20] */
 #define MOVE_CREEP_DIST         0.04f  /* 蠕变区距离 m: 进入后硬限速 */
-#define MOVE_CREEP_SPEED        0.04f  /* 蠕变区最高速度 m/s (40mm/s, Move_Stop无冲击) */
+#define MOVE_CREEP_SPEED        0.03f  /* 蠕变区最高速度 m/s [0.04→0.03: 加重后末端更柔, 减小小过冲] */
 
 /* 旋转 (按Blu3比例带设计: KP×比例带≈限幅, P控制自然减速) */
 #define MOVE_YAW_KP             0.004f /* 航向误差(°) → 角速度(m/s轮速) [Blu3=1.2°→RPM÷293.9] */
 #define MOVE_YAW_HOLD_LIMIT     0.12f  /* 移动中航向修正限幅 m/s [第二档提速同步提高] */
-#define MOVE_YAW_HOLD_DEADZONE  2.0f   /* 航向保持死区 ° (误差<此值不修正, 防直线摇摆) */
-#define MOVE_YAW_TURN_LIMIT     0.35f  /* 原地旋转限幅 m/s [0.40→0.35: 180°仍过冲, 再降一档] */
-#define MOVE_YAW_DECEL_DEG      35.0f  /* 旋转减速区 ° [30→35: 增加减速余量] */
+#define MOVE_YAW_HOLD_DEADZONE  1.0f   /* 航向保持死区 ° */
+#define MOVE_YAW_TURN_LIMIT     0.25f  /* 原地旋转限幅 m/s [0.35→0.25: IMU安装/悬挂不稳, 降低转动冲击] */
+#define MOVE_YAW_DECEL_DEG      45.0f  /* 旋转减速区 ° [50→45: 恢复P环+减速区, 减小过冲] */
 #define MOVE_YAW_FINE_SPEED     0.015f /* 近距离(<5°)最低旋转速度 m/s [0.008→0.015: 解决差一点不到位] */
-#define MOVE_YAW_TOL_DEG        0.5f   /* 旋转到位容差 ° [原1.0] */
+#define MOVE_YAW_TOL_DEG        0.2f   /* 旋转到位容差 ° */
+#define MOVE_YAW_ACCEPT_DEG     0.4f   /* 首停后接受阈值 ° (比TOL宽, 容留松手后0.1~0.3°惯性漂移, 防极限环微调) */
+#define MOVE_YAW_STOP_LATENCY_MS 50    /* 旋转停止延迟 ms [100→50: 编码器无IMU通信延迟, 仅CAN+电机响应+惯性] */
+#define MOVE_YAW_SETTLE_WAIT_MS 120    /* 首停后最短等待 ms: 等机械滑行后再判定是否真的到位 */
+#define MOVE_YAW_SETTLE_FRAMES  2      /* 等待后连续控制周期在容差内才返回完成, 防止预测停止后提前返回 */
 #define MOVE_YAW_TURN_TIMEOUT   15000  /* 旋转超时 ms */
 
 /* 电机 */
@@ -103,14 +109,25 @@ typedef struct {
 #define MOVE_ARC_TOL            0.010f /* 圆弧完成容差 m */
 #define MOVE_ARC_TIMEOUT_MS     60000  /* 圆弧超时 ms */
 #define MOVE_ARC_DECEL_DEG      30.0f  /* 末端减速区: [15→30: 电机实际速度3x命令,需更长减速时间] */
-#define MOVE_ARC_STOP_LATENCY_MS 120   /* 停止延迟ms: 插值最优(100→+1.18°,130→-1.21°,120→≈0°) */
+#define MOVE_ARC_ACCEL          0.15f  /* 圆弧切向最大加/减速度 m/s² [启动限加速度,末端v=sqrt(2*a*s)] */
+#define MOVE_ARC_STOP_LATENCY_MS 130   /* 停止延迟ms: 原120ms对应旧重量, 结构增重后惯性增大, 130ms补偿过冲 */
+#define MOVE_ARC_SETTLE_KP      2.0f   /* 弧线settle位置P增益 (修正速度=误差m×此值, 2.0: 3cm→6cm/s) */
+#define MOVE_ARC_SETTLE_MAX_SPEED 0.06f /* 弧线settle修正最高速度 m/s (6cm/s, gentle, 防位置修正冲击) */
+#define MOVE_ARC_POS_TOL        0.010f /* 弧线到位位置容差 m (1cm, 配合KP=2时P输出=MIN_SPEED临界, 静摩擦刚好能克服) */
+#define MOVE_ARC_SWEEP_TOL_DEG  1.0f   /* 圆弧位置扫角完成容差: 防yaw已到但弧长/半径少走时提前结束 */
+#define MOVE_ARC_XY_GAIN        1.04f  /* 圆弧XY切向速度补偿: >1用于修正实车弧长/半径少走 */
+#define MOVE_ARC_OUTWARD_COMP_K 0.06f  /* 圆弧速度相关径向外推补偿: comp=K*v²/R, 抵消高速切内圈 */
+#define MOVE_ARC_OUTWARD_COMP_MAX 0.025f /* 圆弧径向外推补偿限幅 m/s, 防止小半径/高速时过补偿 */
 
 /* 路径跟踪 (线段投影 + 横向修正 + 关键点航向) */
 #define MOVE_WP_MAX_PTS         256    /* 路径点缓冲上限 (256×16B=4KB .bss) */
 #define MOVE_WP_END_TOL         0.010f /* 末端到位容差 m */
 #define MOVE_WP_SPEED           0.30f  /* 默认路径速度 m/s */
 #define MOVE_WP_TIMEOUT_MS      15000  /* 路径跟踪超时 ms */
-#define MOVE_WP_LAT_KP          2.0f   /* 横向修正增益 (误差m→修正m/s) */
+#define MOVE_WP_PASS_RADIUS     0.080f /* 普通通过点提前切段半径 m: 减少折线点停车/硬拐 */
+#define MOVE_WP_LAT_KP          0.8f   /* 横向修正增益 (误差m→修正m/s), path需保守防蛇形震荡 */
+#define MOVE_WP_LAT_MAX_RATIO   0.30f  /* 横向修正速度上限=切向速度×此比例, 防追线过猛 */
+#define MOVE_WP_SETTLE_MAX_SPEED 0.06f /* 终点位置收敛最高速度 m/s, 防到位附近来回摆 */
 #define MOVE_WP_YAW_KP          0.012f /* 航向P增益 (°→m/s轮速差) [验证甜点: 0.012+21ms=0.6稳,降值更差,非振荡] */
 #define MOVE_WP_YAW_MAX         0.30f /* 航向修正限幅 m/s [v/R×L_SUM: v=0.8,R=0.5→0.272, 留余量; 右轮=vy-wz=0.50>0不反转] */
 #define MOVE_WP_KEY_DECEL_DIST  0.15f  /* 关键点减速区 m */
@@ -131,7 +148,7 @@ typedef struct {
  * ================================================================ */
 extern volatile float move_x;      /* 全局X坐标 m (右正) */
 extern volatile float move_y;      /* 全局Y坐标 m (前进) */
-extern volatile float move_yaw;    /* 全局航向 ° (CW正, =-g_imu_yaw) */
+extern volatile float move_yaw;    /* 全局航向 ° (CW正; 全程编码器) */
 extern volatile float move_target_yaw; /* 运动开始时锁定的目标航向 ° (CW正) */
 
 /* 活跃标志: 1=Move模块正在控制电机, OdomTask应跳过CAN读取 */
@@ -144,6 +161,7 @@ extern volatile uint8_t g_move_active;
 /* 位姿管理 */
 void Move_InitPose(float x, float y, float yaw_deg);
 void Move_ResetPose(void);
+float Move_GetYaw(void);
 
 /* 速度设置 (内部+外部可用, 直接发CAN) */
 void Move_SetRobotVelocity(float vx, float vy, float wz);
@@ -177,16 +195,16 @@ uint8_t MoveArc(float cx, float cy, float radius,
  * 前馈wz=(v/R)×L_SUM消除曲线上稳态滞后, P反馈修正 transient 误差.
  * 径向P修正保持机器人在弧线上.
  * dir: +1=CW(右转), -1=CCW(左转)
- * sweep_deg: 弧度 (180=半圆, 360=整圆)
+ * sweep_deg: 扫过角度° (180=半圆, 360=整圆)
  */
 uint8_t MoveArcTrack(float radius, float speed, int dir,
                      float sweep_deg, uint32_t timeout_ms);
 
-/* 路径跟踪 (线段投影 + 横向修正 + 姿态控制)
+/* 路径跟踪 (线段投影 + 横向修正 + 起始航向保持)
  * 上位机发路径点(x,y,target_theta,mode) → Move_PathBegin + 多次Move_PathAddPoint 装载 →
  * NavTask调用MovePathTrack阻塞跟踪:
- *   普通点(mode=0): 位置跟踪 + 切线跟随(方向自动从线段算, wz=Kp×误差)
- *   关键点(mode=1): 位置跟踪 + 目标姿态(方向=target_theta, 关键点减速) */
+ *   普通点(mode=0): 线段跟踪 + 起始航向保持, 进入通过半径后不停顿切下一段
+ *   关键点(mode=1): 接近时减速; 若为终点, 先位置到位再RotateTo到target_theta */
 void    Move_PathBegin(uint8_t count, float speed);                      /* ISR: 预告点数+速度, 清零缓冲 */
 void    Move_PathAddPoint(float x, float y, float target_theta, uint8_t mode); /* ISR: 追加一个路径点 */
 uint8_t MovePathTrack(void);                                             /* NavTask: 阻塞跟踪, 1=完成 0=超时/中止 */

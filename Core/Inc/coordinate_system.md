@@ -16,10 +16,10 @@
 - X(右) = Blu3 dx(右)
 - Y(前) = Blu3 dy(前)
 
-唯一差异是旋转方向:
-- 外部 θ: CW正 (顺时针)
-- 内部 g_imu_yaw: CCW正 (逆时针)
-- 映射: move_yaw = -g_imu_yaw
+旋转方向: 全链路统一 CW正 (命令 / 控制 / 里程计 / 位姿上报)。
+- move_yaw: CW正(度), 全程由编码器积分维护
+- g_odom_theta: CW正(弧度) = move_yaw × π/180
+- g_imu_yaw/g_imu_yaw_raw: IMU原始航向, 正方向由安装决定; 仅保留诊断/校准用, 不参与运动角度闭环
 
 ## 里程计公式
 
@@ -28,10 +28,15 @@
 dy_body = (d_FL + d_FR + d_RL + d_RR) / 4    // 前进
 dx_body = (d_FL - d_FR - d_RL + d_RR) / 4    // 右移 (右轮镜像已取反)
 
-// 体坐标 → 场坐标 (yaw_deg = g_imu_yaw, CCW正)
-move_x +=  dx_body * cos(yaw_deg) + dy_body * sin(yaw_deg)     // +X = 右
-move_y += -dx_body * sin(yaw_deg) + dy_body * cos(yaw_deg)     // +Y = 前
-move_yaw = -yaw_deg                                              // CW正 = -IMU
+// 普通段航向角: 由编码器积分到外部CW正
+move_yaw += ((d_FL - d_FR + d_RL - d_RR) / 4) / MOVE_YAW_L_SUM * 180/pi
+
+// 圆弧段航向角: 与普通段一致, 仍由编码器积分
+move_yaw += ((d_FL - d_FR + d_RL - d_RR) / 4) / MOVE_ARC_YAW_L_SUM * 180/pi
+
+// 体坐标 → 场坐标 (公式按 CW+ 角写; 代码内部先转 CCW 再用标准旋转阵)
+move_x +=  dx_body * cos(yaw) + dy_body * sin(yaw)     // +X = 右
+move_y += -dx_body * sin(yaw) + dy_body * cos(yaw)     // +Y = 前
 ```
 
 ## 麦轮逆运动学 (内部, 不对外暴露)
@@ -42,7 +47,7 @@ w_FR = vy - vx - wz    // 右前 (镜像安装)
 w_RL = vy - vx + wz    // 左后
 w_RR = vy + vx - wz    // 右后 (镜像安装)
 
-其中: vy=前进, vx=右移, wz=CCW旋转 (Blu3体坐标)
+其中: vy=前进, vx=右移, wz=CW旋转 (顺时针正, 与move_yaw一致)
 ```
 
 ## 调用示例
@@ -64,11 +69,11 @@ MoveArcTrack(0.3, 0.10, +1, 90.0, 60000);
 
 ## CommTask位姿上报
 
-CommTask读取的g_odom_x/y/theta由move_sync_to_odom()同步:
+CommTask读取的g_odom_x/y/theta由move_sync_to_odom()同步 (运动中),
+待机时由OdomTask用编码器维护XY和yaw:
 ```c
 g_odom_x     = move_x;                          // 右方向 m
 g_odom_y     = move_y;                          // 前进方向 m
-g_odom_theta = g_imu_yaw * (pi/180);            // 弧度, CCW正 (内部)
+g_odom_theta = move_yaw * (pi/180);             // 弧度, CW正
 ```
-
-上位机当前不使用POSE反馈 (导航命令模式)。
+上报前归一到 [-π, π)。上位机 test_comm.py 显示 yaw(CW+)。

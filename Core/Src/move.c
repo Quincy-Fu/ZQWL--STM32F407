@@ -2,10 +2,11 @@
  * @file    move.c
  * @brief   底层运动控制模块 — 移植自Blu3 Move层
  *
- * 30ms控制环: P环位置控制 + 编码器回读里程计 + IMU航向保持。
- * 阻塞式API, 在NavTask中调用。
+ * 30ms控制环: P环位置控制 + 编码器回读XY/航向里程计.
+ * 阻塞式API, 在NavTask中调用.
+ * 注: 全程使用编码器yaw; IMU仅保留诊断/校准, 不参与运动角度闭环.
  *
- * 坐标系: vy>0=前进, vx>0=右移, wz>0=CCW
+ * 坐标系: vy>0=前进, vx>0=右移, wz>0=CW(顺时针)
  * 电机地址: FL=0x01, FR=0x02, RL=0x03, RR=0x04
  * 右轮(FR/RR)镜像安装, motor_emit方向反转。
  */
@@ -20,9 +21,6 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "cmsis_os.h"
-
-/* 路径测试模块: 前馈开关 (定义在 move_path_test.c) */
-extern volatile uint8_t g_path_test_yaw_ff;
 
 /* ================================================================
  *  全局变量定义
@@ -46,12 +44,9 @@ volatile uint8_t g_path_debug_en = 1;                  /* 调试帧开关: 1=开
 /* ================================================================
  *  外部引用 (freertos.c / imu_protocol.c)
  * ================================================================ */
-extern volatile float g_imu_yaw;       /* IMU偏航角, 度, 上电归零 (模块内部融合, 无二次滤波) */
-extern volatile float g_imu_yaw_raw;  /* 无LPF原始yaw(freertos.c定义), swept_imu停止预测用, 防滤波滞后 */
-extern volatile uint32_t g_imu_last_tick; /* IMU最近一次更新的tick */
 extern volatile float g_odom_x;        /* 里程计X, 同步用 */
 extern volatile float g_odom_y;        /* 里程计Y, 同步用 */
-extern volatile float g_odom_theta;    /* 里程计theta, 同步用 */
+extern volatile float g_odom_theta;    /* 里程计theta(CW+弧度), 同步用 */
 /* [调试用,定位后删除] 路径跟踪遥测, 定义在freertos.c */
 extern void SendPathDebugToPC(float mx, float my, int16_t wp_idx, int16_t total,
                               float vx_f, float vy_f, float wz, float target_yaw,
@@ -69,6 +64,7 @@ static const uint8_t wheel_mirror[4] = {0, 1, 0, 1};
 /* 编码器上一次读数 (S_CPOS累计脉冲) */
 static int32_t enc_last[4] = {0, 0, 0, 0};
 static bool    enc_has_last = false;
+static uint8_t arc_yaw_l_sum_active = 0; /* 1=圆弧段使用MOVE_ARC_YAW_L_SUM, 0=普通段使用MOVE_YAW_L_SUM */
 
 /* 每轮命令速度 (回读失败时的fallback) */
 static float cmd_wheel_rpm[4] = {0, 0, 0, 0};
@@ -80,6 +76,7 @@ static PathPt_t g_path_pts[MOVE_WP_MAX_PTS];
 static volatile uint8_t g_path_count    = 0;   /* 已装载点数 */
 static volatile uint8_t g_path_expected = 0;   /* BEGIN预告的点数 (校验用) */
 static volatile float   g_path_speed    = MOVE_WP_SPEED;
+static volatile uint8_t g_path_load_error = 0; /* 装载期间发现非法点/超长/模式错误 */
 
 /* ================================================================
  *  静态辅助函数
@@ -279,7 +276,7 @@ static uint8_t move_read_all_encoders(int32_t cur_pos[4])
  * 场坐标系 (+X=右, +Y=前, CW正, 与Blu3场坐标一致):
  *   move_x +=  dx_body*cos(yaw) + dy_body*sin(yaw)   右方向
  *   move_y += -dx_body*sin(yaw) + dy_body*cos(yaw)   前进方向
- *   move_yaw = -g_imu_yaw                            CW正
+ *   move_yaw += ((d0-d1+d2-d3)/4)/YAW_L_SUM       CW正(全程编码器)
  *
  * 注: 内部dx_body/dy_body用Blu3体坐标(right/forward),
  *     X(右)/Y(前)与dx(右)/dy(前)方向一致, 无需轴交换.
@@ -317,12 +314,16 @@ static void move_update_odom(const int32_t cur_pos[4])
     float d2 =  (float)dbg_enc_delta[2] * MOVE_ENC_TO_M;  /* RL */
     float d3 = -(float)dbg_enc_delta[3] * MOVE_ENC_TO_M;  /* RR mirror */
 
-    /* 麦轮正运动学 → 体坐标系位移 */
+    /* 麦轮正运动学 → 体坐标系位移/航向增量 */
     float dx_body = (d0 - d1 - d2 + d3) * 0.25f;   /* 右移 */
     float dy_body = (d0 + d1 + d2 + d3) * 0.25f;   /* 前进 */
+    float yaw_l_sum = arc_yaw_l_sum_active ? MOVE_ARC_YAW_L_SUM : MOVE_YAW_L_SUM;
+    float dtheta_cw = ((d0 - d1 + d2 - d3) * 0.25f) / yaw_l_sum * 57.2957795f;
 
-    /* IMU航向 */
-    float yaw_deg = g_imu_yaw;
+    move_yaw += dtheta_cw;
+
+    /* 场坐标变换: 数学旋转仍用CCW正, 外部move_yaw保持CW正。 */
+    float yaw_deg = -move_yaw;   /* 外部CW正 → 内部CCW正 */
     float cy = move_cos(yaw_deg);
     float sy = move_sin(yaw_deg);
 
@@ -337,7 +338,6 @@ static void move_update_odom(const int32_t cur_pos[4])
     /* 累加 */
     move_x += dX_field;
     move_y += dY_field;
-    move_yaw = -yaw_deg;   /* CW正 = -IMU(CCW正) */
 
     /* 保存当前读数 */
     for (uint8_t i = 0; i < 4; i++) enc_last[i] = cur_pos[i];
@@ -351,14 +351,14 @@ void Move_InitPose(float x, float y, float yaw_deg)
 {
     move_x = x;
     move_y = y;
-    move_yaw = -g_imu_yaw;          /* CW正 = -IMU(CCW正) */
+    move_yaw = yaw_deg;               /* CW正, 编码器yaw积分基准 */
     move_target_yaw = move_yaw;
 
-    /* 同步到全局里程计 (CommTask读取, 内部Blu3惯例: dx=右, dy=前, CCW+) */
+    /* 同步到全局里程计 (CommTask读取上报, 约定: dx=右, dy=前, theta=CW+弧度) */
     __disable_irq();
     g_odom_x = x;                      /* 右 = dx (同向) */
     g_odom_y = y;                      /* 前 = dy (同向) */
-    g_odom_theta = g_imu_yaw * 0.01745329f;  /* 内部CCW正弧度 */
+    g_odom_theta = move_yaw * 0.01745329f;  /* CW+弧度, 与 move_yaw 同源同约定 */
     __enable_irq();
 
     /* 重置编码器基准, 避免下次odom跳变 */
@@ -367,7 +367,12 @@ void Move_InitPose(float x, float y, float yaw_deg)
 
 void Move_ResetPose(void)
 {
-    Move_InitPose(0.0f, 0.0f, 0.0f);  /* yaw_deg unused, move_yaw = -g_imu_yaw */
+    Move_InitPose(0.0f, 0.0f, 0.0f);  /* 当前编码器航向基准归零 */
+}
+
+float Move_GetYaw(void)
+{
+    return move_yaw;
 }
 
 /* ================================================================
@@ -426,8 +431,8 @@ void Move_SetFieldVelocity(float vx_f, float vy_f, float wz)
     float blu3_vx_f = vx_f;   /* 右 → 右 */
     float blu3_vy_f = vy_f;   /* 前 → 前 */
 
-    /* 旋转: 场→体 (用内部yaw, CCW正; move_yaw是CW正=-g_imu_yaw) */
-    float internal_yaw = -move_yaw;   /* = g_imu_yaw, CCW正 */
+    /* 旋转: 场→体。数学旋转用CCW正, move_yaw对外保持CW正。 */
+    float internal_yaw = -move_yaw;   /* CCW正 */
     float ci = move_cos(internal_yaw);
     float si = move_sin(internal_yaw);
     float vx_body =  blu3_vx_f * ci + blu3_vy_f * si;
@@ -459,7 +464,7 @@ static void move_sync_to_odom(void)
     __disable_irq();
     g_odom_x = move_x;                  /* 右 = dx (同向) */
     g_odom_y = move_y;                  /* 前 = dy (同向) */
-    g_odom_theta = g_imu_yaw * 0.01745329f;  /* 内部CCW正弧度 */
+    g_odom_theta = move_yaw * 0.01745329f;  /* CW+弧度, 与 move_yaw 同源同约定 */
     __enable_irq();
 }
 
@@ -474,7 +479,7 @@ static void move_sync_to_odom(void)
  *   1. 读4轮编码器 → 里程计积分
  *   2. 算距离误差 → P控制算速度
  *   3. 场坐标系分解vx/vy
- *   4. Yaw保持: (target_yaw - imu_yaw) * YAW_KP → wz
+ *   4. Yaw保持: 编码器yaw误差 * YAW_KP → wz
  *   5. 发送4轮速度
  *   6. 检查到位/超时
  *
@@ -485,7 +490,7 @@ uint8_t MoveToAccurateTimed(float tx, float ty, float max_speed,
 {
     g_move_active = 1;
 
-    /* 锁定目标航向 (外部CW+ = move_yaw = -g_imu_yaw) */
+    /* 锁定目标航向 (外部CW+ = move_yaw, 普通段编码器来源) */
     move_target_yaw = move_yaw;
 
     /* 重置编码器基准 */
@@ -501,14 +506,6 @@ uint8_t MoveToAccurateTimed(float tx, float ty, float max_speed,
     for (;;) {
         /* 超时检查 */
         if (move_tick() - t0 >= timeout_ms) {
-            Move_Stop();
-            move_sync_to_odom();
-            g_move_active = 0;
-            return 0;
-        }
-
-        /* IMU通信看门狗: 200ms无更新→急停 */
-        if (move_tick() - g_imu_last_tick > MOVE_IMU_TIMEOUT_MS) {
             Move_Stop();
             move_sync_to_odom();
             g_move_active = 0;
@@ -594,9 +591,9 @@ uint8_t MoveToAccurateTimed(float tx, float ty, float max_speed,
         float vx_f = (dx / dist) * speed;   /* 右移分量 */
         float vy_f = (dy / dist) * speed;   /* 前进分量 */
 
-        /* 6. Yaw保持: err是CCW+, 取反→CW+给SetFieldVelocity
-         *    死区内不修正, 防止IMU噪声导致直线摇摆 */
-        float yaw_err = (-move_target_yaw) - g_imu_yaw;
+        /* 6. Yaw保持: current-target为正表示已偏CW, 需要输出CCW修正。
+         *    死区内不修正, 防编码器量化/机械微抖导致直线摇摆 */
+        float yaw_err = move_yaw - move_target_yaw;  /* CW+: current-target → CCW+误差 */
         while (yaw_err >  180.0f) yaw_err -= 360.0f;
         while (yaw_err < -180.0f) yaw_err += 360.0f;
         float wz = 0.0f;
@@ -646,21 +643,34 @@ uint8_t RotateToTimed(float target_yaw_deg, float max_speed,
 
     uint32_t t0 = move_tick();
 
-    /* 预测性停止: 追踪IMU角速度, 提前补偿30ms stop延迟 */
-    float prev_imu_yaw = g_imu_yaw;
-    uint32_t prev_imu_tick = t0;
+    uint8_t settle_cnt = 0;       /* settle计数: 停稳等待后连续控制周期在容差内才算到位 */
+    uint8_t stopped = 0;          /* 当前是否已停电机并等待滑行稳定 */
+    uint8_t had_stopped = 0;      /* 本次RotateTo是否已经触发过预测停止 */
+    uint32_t stopped_tick = t0;   /* 最近一次停电机时刻 */
+    uint32_t settle_last_tick = t0; /* 上次计入settle的控制周期 */
+
+    /* 预检查: 若起始误差已在ACCEPT内 (如重复发送同一角度命令),
+     * 先停电机并等待机械滑行稳定, 避免无意义微动。 */
+    {
+        float init_err = target_yaw_deg - move_yaw;
+        while (init_err >  180.0f) init_err -= 360.0f;
+        while (init_err < -180.0f) init_err += 360.0f;
+        if (move_abs(init_err) <= MOVE_YAW_ACCEPT_DEG) {
+            Move_Stop();
+            stopped = 1;
+            had_stopped = 1;
+            stopped_tick = move_tick();
+            settle_last_tick = stopped_tick;
+        }
+    }
+
+    /* 追踪编码器角速度 (用于预测性停止) */
+    float prev_yaw_enc = move_yaw;   /* 上一帧编码器yaw (CW正) */
+    uint32_t prev_yaw_tick = t0;
     float yaw_rate_lp = 0.0f;   /* 滤波后的角速度 °/s */
 
     for (;;) {
         if (move_tick() - t0 >= timeout_ms) {
-            Move_Stop();
-            move_sync_to_odom();
-            g_move_active = 0;
-            return 0;
-        }
-
-        /* IMU通信看门狗: 200ms无更新→急停 */
-        if (move_tick() - g_imu_last_tick > MOVE_IMU_TIMEOUT_MS) {
             Move_Stop();
             move_sync_to_odom();
             g_move_active = 0;
@@ -672,62 +682,97 @@ uint8_t RotateToTimed(float target_yaw_deg, float max_speed,
         move_read_all_encoders(cur_pos);
         move_update_odom(cur_pos);
 
-        /* 航向误差: CCW正, 正→左转(CCW), 负→右转(CW)
-         * err = imu(CCW+) - target(CCW+) = g_imu_yaw - (-target_yaw_deg) */
-        float err = g_imu_yaw - (-target_yaw_deg);
+        /* 航向误差 (CW正, 正→右转CW)
+         * err = target(CW+) - current(CW+) = target_yaw_deg - move_yaw */
+        float err = target_yaw_deg - move_yaw;
         /* 归一化到[-180,180]: 始终走最短路径 */
         while (err >  180.0f) err -= 360.0f;
         while (err < -180.0f) err += 360.0f;
 
-        /* 计算角速度 (°/s), 用于预测性停止 */
-        uint32_t now_imu_tick = move_tick();
-        float dt_imu = (now_imu_tick - prev_imu_tick) * 0.001f;
-        if (dt_imu < 0.001f) dt_imu = 0.001f;
-        float dyaw = g_imu_yaw - prev_imu_yaw;
+        /* 计算编码器角速度 (°/s), 用于预测性停止 */
+        uint32_t now_yaw_tick = move_tick();
+        float dt_yaw = (now_yaw_tick - prev_yaw_tick) * 0.001f;
+        if (dt_yaw < 0.001f) dt_yaw = 0.001f;
+        float dyaw = move_yaw - prev_yaw_enc;
         /* 归一化dyaw避免360°跳变 */
         while (dyaw >  180.0f) dyaw -= 360.0f;
         while (dyaw < -180.0f) dyaw += 360.0f;
-        float yaw_rate = dyaw / dt_imu;
-        /* 低通滤波: 抑制IMU噪声 */
+        float yaw_rate = dyaw / dt_yaw;
+        /* 低通滤波: 抑制编码器读数抖动 */
         yaw_rate_lp = 0.7f * yaw_rate_lp + 0.3f * yaw_rate;
-        prev_imu_yaw = g_imu_yaw;
-        prev_imu_tick = now_imu_tick;
+        prev_yaw_enc = move_yaw;
+        prev_yaw_tick = now_yaw_tick;
 
-        /* 预测性到位判定: 补偿30ms stop延迟 (CAN 20ms + 电机 10ms)
-         * stop_distance = |角速度| × 0.03s (度)
-         * 当 |err| <= 容差 + stop_distance 时提前stop */
-        float stop_distance = move_abs(yaw_rate_lp) * 0.03f;
-        if (move_abs(err) <= MOVE_YAW_TOL_DEG + stop_distance) {
-            Move_Stop();
-            move_yaw = -g_imu_yaw;   /* CW正 = -IMU */
-            move_sync_to_odom();
-            g_move_active = 0;
-            return 1;
-        }
+        /* settle到位:
+         * 1) 预测性停止只负责提前松手, 不负责立即返回完成;
+         * 2) 首停后必须等待机械滑行;
+         * 3) 若停稳后误差仍超过ACCEPT, 继续P控制拉回, 不让上位机再发第二次命令。 */
+        float abs_err = move_abs(err);
+        float predicted_overshoot = move_abs(yaw_rate_lp) * ((float)MOVE_YAW_STOP_LATENCY_MS / 1000.0f);
+        uint8_t should_stop = (abs_err <= MOVE_YAW_TOL_DEG + predicted_overshoot) ? 1u : 0u;
+        uint8_t acceptable_after_stop = (had_stopped && abs_err <= MOVE_YAW_ACCEPT_DEG) ? 1u : 0u;
 
-        /* P控制 → 旋转速度 */
-        float wz = err * MOVE_YAW_KP;
-        /* 近距离(<5°)用更低最低速度, 减少滑行过冲 */
-        float min_spd = (move_abs(err) < 5.0f) ? MOVE_YAW_FINE_SPEED
-                                                : MOVE_MIN_SPEED;
-        if (wz > 0.0f && wz < min_spd)  wz =  min_spd;
-        if (wz < 0.0f && wz > -min_spd) wz = -min_spd;
-        wz = move_clamp(wz, -max_speed, max_speed);
-
-        /* 减速区: sqrt制动曲线 (第一性原理: θ=ω²/2α → ω=√(2αθ)) */
-        {
-            float abs_err = move_abs(err);
-            if (abs_err < MOVE_YAW_DECEL_DEG) {
-                float ratio = abs_err / MOVE_YAW_DECEL_DEG;
-                float decel = max_speed * move_sqrt(ratio);
-                if (decel < MOVE_MIN_SPEED) decel = MOVE_MIN_SPEED;
-                if (move_abs(wz) > decel)
-                    wz = (wz >= 0.0f) ? decel : -decel;
+        if (should_stop) {
+            /* 容差内(或预测将进入): 先松手, 等滑行结束后再判定 */
+            if (!stopped) {
+                Move_Stop();
+                stopped = 1;
+                had_stopped = 1;
+                stopped_tick = move_tick();
+                settle_last_tick = stopped_tick;
+                settle_cnt = 0;
             }
         }
 
-        /* 纯旋转: vx=0, vy=0 */
-        Move_SetRobotVelocity(0.0f, 0.0f, wz);
+        if (stopped) {
+            uint8_t wait_ok = ((move_tick() - stopped_tick) >= MOVE_YAW_SETTLE_WAIT_MS) ? 1u : 0u;
+
+            if (!should_stop && !acceptable_after_stop) {
+                /* 滑行后偏差仍大: 重新进入P控制, 本次命令内自行拉回。 */
+                stopped = 0;
+                settle_cnt = 0;
+            } else if (wait_ok && ((move_tick() - settle_last_tick) >= MOVE_CTRL_PERIOD_MS)) {
+                settle_last_tick = move_tick();
+                if ((abs_err <= MOVE_YAW_TOL_DEG) || acceptable_after_stop) {
+                    settle_cnt++;
+                    if (settle_cnt >= MOVE_YAW_SETTLE_FRAMES) {
+                        move_sync_to_odom();
+                        g_move_active = 0;
+                        return 1;
+                    }
+                } else {
+                    settle_cnt = 0;
+                }
+            }
+        }
+
+        /* P控制 → 旋转速度 (仅在未处于停稳等待时执行) */
+        if (!stopped) {
+            float wz = err * MOVE_YAW_KP;
+            /* 近距离(<5°)用更低最低速度, 减少滑行过冲 */
+            float min_spd = (abs_err < 5.0f) ? MOVE_YAW_FINE_SPEED
+                                                    : MOVE_MIN_SPEED;
+            if (wz > 0.0f && wz < min_spd)  wz =  min_spd;
+            if (wz < 0.0f && wz > -min_spd) wz = -min_spd;
+
+            /* 触发停止后: 大误差用正常速度快速拉回, 只剩小误差才用 FINE_SPEED 细调 */
+            float effective_max = (had_stopped && abs_err < 10.0f) ? MOVE_YAW_FINE_SPEED : max_speed;
+            wz = move_clamp(wz, -effective_max, effective_max);
+
+            /* 减速区: sqrt制动曲线 (第一性原理: θ=ω²/2α → ω=√(2αθ)) */
+            {
+                if (abs_err < MOVE_YAW_DECEL_DEG) {
+                    float ratio = abs_err / MOVE_YAW_DECEL_DEG;
+                    float decel = effective_max * move_sqrt(ratio);
+                    if (decel < MOVE_MIN_SPEED) decel = MOVE_MIN_SPEED;
+                    if (move_abs(wz) > decel)
+                        wz = (wz >= 0.0f) ? decel : -decel;
+                }
+            }
+
+            /* 纯旋转: vx=0, vy=0 */
+            Move_SetRobotVelocity(0.0f, 0.0f, wz);
+        }
 
         move_sync_to_odom();
         move_delay(MOVE_CTRL_PERIOD_MS);
@@ -776,17 +821,10 @@ uint8_t MoveToAxisLockTimed(float tx, float ty,
     float prev_main_dist = -1.0f;
     uint32_t prev_tick_ax = t0;
     float v_approach_lp_ax = 0.0f;
+    uint8_t main_arrived = 0;           /* 主轴已到位(副轴纠正中), 主轴停转 */
 
     for (;;) {
         if (move_tick() - t0 >= timeout_ms) {
-            Move_Stop();
-            move_sync_to_odom();
-            g_move_active = 0;
-            return 0;
-        }
-
-        /* IMU通信看门狗: 200ms无更新→急停 */
-        if (move_tick() - g_imu_last_tick > MOVE_IMU_TIMEOUT_MS) {
             Move_Stop();
             move_sync_to_odom();
             g_move_active = 0;
@@ -815,12 +853,19 @@ uint8_t MoveToAxisLockTimed(float tx, float ty,
         prev_main_dist = main_dist;
         prev_tick_ax = now_tick_ax;
 
-        /* 到位检查 */
+        /* 到位检查: 主轴+副轴都到位才完成
+         * 主轴到位但副轴没到 → 标记main_arrived, 主轴停转, 副轴继续纠正
+         * (边走边调到位, 不需要到位后补偿轮) */
+        float lock_err_chk = (axis == MOVE_AXIS_X) ? (lock_val - move_y) : (lock_val - move_x);
         if (main_dist <= main_tol) {
-            Move_Stop();
-            move_sync_to_odom();
-            g_move_active = 0;
-            return 1;
+            if (move_abs(lock_err_chk) <= lock_tol) {
+                /* 两轴都到位 → 完成 */
+                Move_Stop();
+                move_sync_to_odom();
+                g_move_active = 0;
+                return 1;
+            }
+            main_arrived = 1;  /* 主轴到位, 副轴还在纠正中 */
         }
 
         /* 软启动: 前RAMP_TIME_MS内线性加速 */
@@ -853,6 +898,9 @@ uint8_t MoveToAxisLockTimed(float tx, float ty,
             if (main_spd > creep_cap) main_spd = creep_cap;
         }
 
+        /* 主轴已到位: 停主轴, 只修副轴 (防主轴越过目标) */
+        if (main_arrived) main_spd = 0.0f;
+
         float main_sign = (main_err >= 0.0f) ? 1.0f : -1.0f;
 
         /* 副轴误差 → 纠正 */
@@ -875,9 +923,9 @@ uint8_t MoveToAxisLockTimed(float tx, float ty,
             vy_f = main_sign * main_spd;  /* 主轴=Y(前) */
         }
 
-        /* Yaw保持: err是CCW+, 取反→CW+给SetFieldVelocity
-         *    死区内不修正, 防止IMU噪声导致直线摇摆 */
-        float yaw_err = (-move_target_yaw) - g_imu_yaw;
+        /* Yaw保持: current-target为正表示已偏CW, 需要输出CCW修正。
+         * 死区内不修正, 防IMU噪声导致直线摇摆。 */
+        float yaw_err = move_yaw - move_target_yaw;  /* CW+: current-target → CCW+误差 */
         while (yaw_err >  180.0f) yaw_err -= 360.0f;
         while (yaw_err < -180.0f) yaw_err += 360.0f;
         float wz = 0.0f;
@@ -1024,7 +1072,7 @@ uint8_t MoveArc(float cx, float cy, float radius,
  *  控制函数 — MoveArcTrack (圆弧轨迹跟踪)
  *
  *  弧长参数化: θ=s/R, 目标姿态=start_yaw+dir×θ
- *  前馈: wz_ff=(v/R)×L_SUM → 消除曲线上稳态滞后(无需积分)
+ *  前馈: wz_ff=(v/R)×ARC_YAW_L_SUM → 消除曲线上稳态滞后(无需积分)
  *  反馈: wz_p=KP×(yaw_err) → 修正 transient 误差
  *  径向P修正保持机器人在弧线上
  *  位置算θ(非时间), 速度波动不影响角度精度
@@ -1034,11 +1082,14 @@ uint8_t MoveArcTrack(float radius, float speed, int dir,
                      float sweep_deg, uint32_t timeout_ms)
 {
     if (radius < 0.01f || speed < 0.01f || dir == 0) return 0;
+    dir = (dir > 0) ? 1 : -1;
+    if (sweep_deg < 0.0f) sweep_deg = -sweep_deg;
 
     g_move_active = 1;
+    arc_yaw_l_sum_active = 1;
     enc_has_last = false;
 
-    float start_yaw = -g_imu_yaw;            /* CW+ 度 */
+    float start_yaw = move_yaw;             /* CW正, 圆弧起点使用编码器yaw */
     float cx = move_x + (float)dir * radius * move_cos(start_yaw);
     float cy = move_y - (float)dir * radius * move_sin(start_yaw);
 
@@ -1047,19 +1098,33 @@ uint8_t MoveArcTrack(float radius, float speed, int dir,
     float prev_angle = move_atan2(dy0, dx0);
 
     float swept = 0.0f;       /* 编码器位置估算 (切线/径向/航向目标用) */
-    float swept_imu = 0.0f;   /* IMU航向估算 (减速/停止用, 不受打滑影响) */
-    float prev_yaw = -g_imu_yaw_raw;  /* CW+ 累积用 */
-    float yaw_rate_lp = 0.0f;  /* IMU实际角速度 °/s (给停止预测用, 非命令速度) */
+    float swept_yaw = 0.0f;   /* 编码器航向估算 (减速/停止用) */
+    float prev_yaw = start_yaw;  /* CW+ 累积用 (编码器yaw) */
+    float yaw_rate_lp = 0.0f;  /* 编码器角速度 °/s (给停止预测用) */
     uint32_t t0 = move_tick();
     uint32_t prev_yaw_tick = t0;
     uint32_t prev_iter_tick = t0;
 
+    /* 弧线终点目标航向 (CW+), settle阶段用 */
+    float final_target_yaw = start_yaw + (float)dir * sweep_deg;
+    while (final_target_yaw >  180.0f) final_target_yaw -= 360.0f;
+    while (final_target_yaw < -180.0f) final_target_yaw += 360.0f;
+
+    /* 弧线终点目标位置: 绕圆心旋转 start→end
+     * 外部dir=+1表示CW右转, 但下面的二维旋转矩阵以CCW为正,
+     * 所以理论终点位置必须使用 -dir*sweep_deg。 */
+    float v0x = move_x - cx;
+    float v0y = move_y - cy;
+    float theta_end = -(float)dir * sweep_deg;  /* 数学旋转角: CCW为正 */
+    float cos_te = move_cos(theta_end);
+    float sin_te = move_sin(theta_end);
+    float end_x = cx + v0x * cos_te - v0y * sin_te;
+    float end_y = cy + v0x * sin_te + v0y * cos_te;
+
     for (;;) {
         if (move_tick() - t0 >= timeout_ms) {
-            Move_Stop(); move_sync_to_odom(); g_move_active = 0;
-            return 0;
-        }
-        if (move_tick() - g_imu_last_tick > MOVE_IMU_TIMEOUT_MS) {
+            arc_yaw_l_sum_active = 0;
+            enc_has_last = false;
             Move_Stop(); move_sync_to_odom(); g_move_active = 0;
             return 0;
         }
@@ -1082,15 +1147,15 @@ uint8_t MoveArcTrack(float radius, float speed, int dir,
         swept += move_abs(delta);
         prev_angle = cur_angle;
 
-        /* IMU航向累计 (用于停止判断, 不受打滑影响) */
-        float cur_yaw_raw = -g_imu_yaw_raw;
+        /* 编码器航向累计 (用于减速和停止判断) */
+        float cur_yaw_raw = move_yaw;
         float yaw_delta = cur_yaw_raw - prev_yaw;
         while (yaw_delta >  180.0f) yaw_delta -= 360.0f;
         while (yaw_delta < -180.0f) yaw_delta += 360.0f;
-        swept_imu += move_abs(yaw_delta);
+        swept_yaw += move_abs(yaw_delta);
         prev_yaw = cur_yaw_raw;
 
-        /* IMU实际角速度 (停止预测用, 非命令速度) */
+        /* 编码器角速度 (停止预测用, 非命令速度) */
         uint32_t now_yaw_tick = move_tick();
         float dt_yaw = (now_yaw_tick - prev_yaw_tick) * 0.001f;
         if (dt_yaw < 0.001f) dt_yaw = 0.001f;
@@ -1098,29 +1163,101 @@ uint8_t MoveArcTrack(float radius, float speed, int dir,
         yaw_rate_lp = 0.7f * yaw_rate_lp + 0.3f * yaw_rate;
         prev_yaw_tick = now_yaw_tick;
 
-        /* 软启动 ramp */
-        float ramp = (float)(move_tick() - t0) / (float)MOVE_RAMP_TIME_MS;
-        if (ramp > 1.0f) ramp = 1.0f;
-        float vf = speed * ramp;
+        /* 圆弧启动限加速度: 避免0.30m/s时200ms ramp带来过大的横向冲击 */
+        float elapsed_s = (float)(move_tick() - t0) * 0.001f;
+        float vf = speed;
+        float vf_accel = MOVE_ARC_ACCEL * elapsed_s;
+        if (vf > vf_accel) vf = vf_accel;
 
-        /* 末端减速: 剩余<DECEL_DEG时线性降速到蠕变速度 (IMU swept为准) */
-        float remaining_deg = sweep_deg - swept_imu;
-        if (remaining_deg < MOVE_ARC_DECEL_DEG) {
-            float ratio = remaining_deg / MOVE_ARC_DECEL_DEG;
-            float decel_vf = speed * ratio;
-            if (decel_vf < MOVE_CREEP_SPEED) decel_vf = MOVE_CREEP_SPEED;
-            if (decel_vf < vf) vf = decel_vf;
-        }
+        /* 末端减速: yaw和位置扫角任一方没跟上, 都不能按完成处理。
+         * 之前只按swept_yaw减速/停止, 会出现角度到了但弧长少走, 最终位置偏左。 */
+        float arc_progress = (swept_yaw < swept) ? swept_yaw : swept;
+        float remaining_deg = sweep_deg - arc_progress;
+        float s_rem = (remaining_deg > 0.0f) ?
+                      (remaining_deg * (3.14159265f / 180.0f) * radius) : 0.0f;
+        float vf_profile = move_sqrt(2.0f * MOVE_ARC_ACCEL * s_rem);
+        if (vf_profile < MOVE_CREEP_SPEED) vf_profile = MOVE_CREEP_SPEED;
+        if (vf_profile < vf) vf = vf_profile;
 
-        /* 完成检查 + 停止预测: 用IMU实际角速度预测过冲 */
+        /* 完成检查 + 停止预测: yaw预测到位且位置扫角也走够, 才进入settle */
         float predicted_overshoot = yaw_rate_lp * ((float)MOVE_ARC_STOP_LATENCY_MS / 1000.0f);
-        if (swept_imu + predicted_overshoot >= sweep_deg) {
+        uint8_t yaw_done = (swept_yaw + predicted_overshoot >= sweep_deg);
+        uint8_t pos_sweep_done = (swept + MOVE_ARC_SWEEP_TOL_DEG >= sweep_deg);
+        if (yaw_done && pos_sweep_done) {
             Move_Stop();
-            move_delay(100);  /* 等IMU报新帧 */
-            int32_t final_pos[4];
-            move_read_all_encoders(final_pos);
-            move_update_odom(final_pos);
-            move_yaw = -g_imu_yaw;
+            move_delay(100);  /* 机械惯性 settling 缓冲 */
+
+            /* settle: 位置+航向联合P修正, 连续2帧在容差内才完成
+             * 原来只被动等惯性消减→只修航向不修XY→几厘米偏差不修正
+             * 现在: P拉向终点(end_x,end_y) + yaw hold, 位置和航向都修正
+             * end_x/end_y 在弧线开始时按CW/CCW约定算好, 此处只使用目标结果 */
+            uint8_t settle_cnt = 0;
+            uint32_t settle_t0 = move_tick();
+            while (move_tick() - settle_t0 < 1000u) {  /* 最多1000ms (含位置修正) */
+                int32_t settle_pos[4];
+                move_read_all_encoders(settle_pos);
+                move_update_odom(settle_pos);
+                /* settle 阶段继续使用编码器yaw, 与弧线主循环一致 */
+
+                /* 位置误差 (场坐标: x=右, y=前) */
+                float pos_err_x = end_x - move_x;
+                float pos_err_y = end_y - move_y;
+                float pos_err_dist = move_sqrt(pos_err_x * pos_err_x
+                                             + pos_err_y * pos_err_y);
+
+                /* 航向误差 (CW+) */
+                float yaw_err = final_target_yaw - move_yaw;
+                while (yaw_err >  180.0f) yaw_err -= 360.0f;
+                while (yaw_err < -180.0f) yaw_err += 360.0f;
+
+                /* 联合判定: 位置+航向都在容差内才算这一帧OK */
+                if (pos_err_dist <= MOVE_ARC_POS_TOL &&
+                    move_abs(yaw_err) <= MOVE_YAW_ACCEPT_DEG) {
+                    settle_cnt++;
+                    Move_Stop();
+                    if (settle_cnt >= 2) break;
+                } else {
+                    settle_cnt = 0;
+                    /* 位置P修正: 拉向终点 */
+                    float vx = pos_err_x * MOVE_ARC_SETTLE_KP;
+                    float vy = pos_err_y * MOVE_ARC_SETTLE_KP;
+                    float spd = move_sqrt(vx * vx + vy * vy);
+                    /* 最低速度地板: 克服静摩擦 (tolerance宽, 极限环风险低) */
+                    if (spd > 0.0001f && spd < MOVE_MIN_SPEED) {
+                        float s = MOVE_MIN_SPEED / spd;
+                        vx *= s; vy *= s; spd = MOVE_MIN_SPEED;
+                    }
+                    /* 最高限速: gentle修正, 防冲击 */
+                    if (spd > MOVE_ARC_SETTLE_MAX_SPEED) {
+                        float s = MOVE_ARC_SETTLE_MAX_SPEED / spd;
+                        vx *= s; vy *= s;
+                    }
+                    /* 航向保持 (同MoveTo yaw hold, 死区内不修防摇摆) */
+                    float wz = 0.0f;
+                    if (move_abs(yaw_err) > MOVE_YAW_HOLD_DEADZONE) {
+                        wz = yaw_err * MOVE_YAW_KP;
+                        wz = move_clamp(wz, -MOVE_YAW_HOLD_LIMIT,
+                                              MOVE_YAW_HOLD_LIMIT);
+                    }
+                    Move_SetFieldVelocity(vx, vy, wz);
+                }
+                move_delay(MOVE_CTRL_PERIOD_MS);
+            }
+            Move_Stop();  /* 确保停驱动 (settle收敛或超时都走这里) */
+            arc_yaw_l_sum_active = 0;
+            enc_has_last = false;
+
+            /* 最终航向修正: 仅在误差超过ACCEPT(0.4°)时才触发RotateTo
+             * 弧线停止后只修正航向, 避免位置修正带来的蠕动 */
+            float final_yaw = move_yaw;   /* 编码器CW+ */
+            float yaw_err_end = final_target_yaw - final_yaw;
+            while (yaw_err_end >  180.0f) yaw_err_end -= 360.0f;
+            while (yaw_err_end < -180.0f) yaw_err_end += 360.0f;
+            if (move_abs(yaw_err_end) > MOVE_YAW_ACCEPT_DEG) {
+                RotateTo(final_target_yaw, MOVE_YAW_TURN_LIMIT);
+            }
+
+            /* 圆弧结束后保持编码器yaw, 后续普通段继续同一来源积分 */
             move_sync_to_odom();
             g_move_active = 0;
             return 1;
@@ -1133,11 +1270,20 @@ uint8_t MoveArcTrack(float radius, float speed, int dir,
 
         /* 径向修正: 拉回目标半径 */
         float r_err = r - radius;
+        float vf_xy = vf * MOVE_ARC_XY_GAIN;
         float radial_spd = r_err * MOVE_ARC_KP_RADIAL;
-        if (radial_spd >  vf) radial_spd =  vf;
-        if (radial_spd < -vf) radial_spd = -vf;
-        float vx_f = vf * tx - radial_spd * dx * inv_r;
-        float vy_f = vf * ty - radial_spd * dy * inv_r;
+        if (radial_spd >  vf_xy) radial_spd =  vf_xy;
+        if (radial_spd < -vf_xy) radial_spd = -vf_xy;
+        float vx_f = vf_xy * tx - radial_spd * dx * inv_r;
+        float vy_f = vf_xy * ty - radial_spd * dy * inv_r;
+
+        /* 速度相关径向外推: 实车高速圆弧会切内圈/半径少走时, 沿圆心->车体方向前馈。
+         * 这比固定车体右向补偿更符合圆弧几何, 左右圆弧都按实际圆心方向处理。 */
+        float outward_comp = MOVE_ARC_OUTWARD_COMP_K * vf * vf / radius;
+        outward_comp = move_clamp(outward_comp, -MOVE_ARC_OUTWARD_COMP_MAX,
+                                                MOVE_ARC_OUTWARD_COMP_MAX);
+        vx_f += outward_comp * dx * inv_r;
+        vy_f += outward_comp * dy * inv_r;
 
         /* 航向: 前馈 + P反馈 */
         float target_yaw = start_yaw + (float)dir * swept;
@@ -1145,7 +1291,7 @@ uint8_t MoveArcTrack(float radius, float speed, int dir,
         while (yaw_err >  180.0f) yaw_err -= 360.0f;
         while (yaw_err < -180.0f) yaw_err += 360.0f;
 
-        float wz_ff = (float)dir * (vf / radius) * MOVE_L_SUM;
+        float wz_ff = (float)dir * (vf / radius) * MOVE_ARC_YAW_L_SUM;
         float wz_p  = yaw_err * MOVE_WP_YAW_KP;
         float wz = wz_ff + wz_p;
         if (wz >  MOVE_WP_YAW_MAX) wz =  MOVE_WP_YAW_MAX;
@@ -1169,8 +1315,8 @@ uint8_t MoveArcTrack(float radius, float speed, int dir,
 /* ================================================================
  *  控制函数 — MovePathTrack (路径跟踪)
  *
- *  线段投影 + 横向误差修正, 麦轮全向平移, 固定航向。
- *  不是"到点停下来", 而是"经过这个点继续走"。
+ *  线段投影 + 横向误差修正 + 起始航向保持。
+ *  普通点不停; 关键点作为终点时先位置到位, 再单独RotateTo到目标角。
  * ================================================================ */
 
 /* 路径缓冲装载 (ISR上下文调用, 仅写全局, 无FreeRTOS调用) */
@@ -1178,70 +1324,59 @@ void Move_PathBegin(uint8_t count, float speed)
 {
     g_path_count    = 0;
     g_path_expected = count;
-    g_path_speed    = speed;
+    g_path_load_error = 0;
+
+    if (count < 2 || count > MOVE_WP_MAX_PTS) {
+        g_path_load_error = 1;
+    }
+
+    if (!(speed > 0.01f)) {
+        speed = MOVE_WP_SPEED;
+    }
+    if (speed > MOVE_MAX_SPEED) {
+        speed = MOVE_MAX_SPEED;
+    }
+    g_path_speed = speed;
 }
 
 void Move_PathAddPoint(float x, float y, float target_theta, uint8_t mode)
 {
-    if (g_path_count < MOVE_WP_MAX_PTS) {
-        g_path_pts[g_path_count].x            = x;
-        g_path_pts[g_path_count].y            = y;
-        g_path_pts[g_path_count].target_theta = target_theta;
-        g_path_pts[g_path_count].mode         = mode;
-        g_path_count++;
+    if (g_path_count >= MOVE_WP_MAX_PTS || g_path_count >= g_path_expected) {
+        g_path_load_error = 1;
+        return;
     }
+
+    if (mode != PATH_MODE_NORMAL && mode != PATH_MODE_KEY) {
+        g_path_load_error = 1;
+        return;
+    }
+
+    g_path_pts[g_path_count].x            = x;
+    g_path_pts[g_path_count].y            = y;
+    g_path_pts[g_path_count].target_theta = target_theta;
+    g_path_pts[g_path_count].mode         = mode;
+    g_path_count++;
 }
 
 /* ── 路径跟踪器 ── */
 
-/* ── 姿态控制器 (独立模块, 可单独测试/替换) ───────────────────
- * mode=0(普通点): 目标=线段切线方向, 车头沿路径切线转
- * mode=1(关键点): 目标=任务指定的target_theta, 到位时角度必须准
- * at_end + mode=0: 已到终点, 无线段可算切线 → wz=0(保持朝向)
- * at_end + mode=1: 仍需转到target_theta → 继续P控制
- * 前馈(可选): 仅mode=1有意义, g_path_test_yaw_ff=1开启
- *
- * 单位约定: wz输出m/s轮速差(运动学w[i]=vy±vx±wz, 与GOTO/MoveArc一致),
- *   NOT rad/s. 旧代码输出rad/s被运动学当m/s→值过大→右轮反转→Emm_V5失控.
+/* ── 路径航向保持 ───────────────────────────────────────────────
+ * path 主循环只负责连续平移追线, 不在普通点按切线方向强行转头。
+ * 原来的“切线跟随 + 横向追线”会让麦轮XY和yaw强耦合, 实车表现为蛇形震荡。
+ * 终点需要指定角度时, 先让位置停稳, 再复用 RotateTo 单独闭环转角。
  */
-static float path_heading_ctrl(const PathPt_t *p, int seg,
-                               float sdx, float sdy,
-                               float vf, float slen,
-                               int at_end, float yaw)
+static float path_yaw_hold_ctrl(float target_yaw, float yaw)
 {
-    /* 普通点 + 到终点: 无线段, 不转 */
-    if (at_end && p[seg+1].mode != PATH_MODE_KEY)
-        return 0.0f;
-
-    /* 确定目标姿态角 */
-    float target_yaw;
-    if (p[seg+1].mode == PATH_MODE_KEY) {
-        target_yaw = p[seg+1].target_theta;           /* 任务指定 */
-    } else {
-        target_yaw = atan2f(sdx, sdy) * (180.0f / 3.14159265f);  /* 切线方向 */
-    }
-
-    /* 姿态误差, 归一化到[-180,+180] */
     float yaw_err = target_yaw - yaw;
     while (yaw_err >  180.0f) yaw_err -= 360.0f;
     while (yaw_err < -180.0f) yaw_err += 360.0f;
 
-    /* P控制: 度×KP = m/s轮速差 (与GOTO/MoveArc同一约定) */
-    float wz = yaw_err * MOVE_WP_YAW_KP;
-
-    /* 角速度前馈: 仅关键点, 可选 (Keil: g_path_test_yaw_ff=1)
-     * dtheta(度)/s × KP = m/s, 与P控制同量纲 */
-    if (g_path_test_yaw_ff && p[seg+1].mode == PATH_MODE_KEY) {
-        float dtheta = p[seg+1].target_theta - p[seg].target_theta;
-        while (dtheta >  180.0f) dtheta -= 360.0f;
-        while (dtheta < -180.0f) dtheta += 360.0f;
-        float omega_deg = (slen > 1e-6f) ? (dtheta * vf / slen) : 0.0f; /* deg/s */
-        wz += omega_deg * MOVE_WP_YAW_KP;  /* 同KP, 保持量纲一致 */
+    if (move_abs(yaw_err) <= MOVE_YAW_HOLD_DEADZONE) {
+        return 0.0f;
     }
 
-    if (wz >  MOVE_WP_YAW_MAX) wz =  MOVE_WP_YAW_MAX;
-    if (wz < -MOVE_WP_YAW_MAX) wz = -MOVE_WP_YAW_MAX;
-    return wz;
+    float wz = yaw_err * MOVE_YAW_KP;
+    return move_clamp(wz, -MOVE_YAW_HOLD_LIMIT, MOVE_YAW_HOLD_LIMIT);
 }
 
 /**
@@ -1249,36 +1384,44 @@ static float path_heading_ctrl(const PathPt_t *p, int seg,
  *
  *         投影机器人位置到当前线段 → 前进速度沿切线 +
  *         横向修正∝偏移 → 投影过末端自动切下一段。
- *         姿态: 普通点跟切线方向, 关键点跟目标姿态角 (path_heading_ctrl).
+ *         姿态: 移动中保持起始航向; 终点若为关键点, 位置到位后再单独RotateTo.
  *
- * @return 1=完成, 0=超时/IMU失联/装载无效
+ * @return 1=完成, 0=超时/装载无效
  */
 uint8_t MovePathTrack(void)
 {
     int   n     = (int)g_path_count;
     float speed = g_path_speed;
 
-    if (n < 2 || n != (int)g_path_expected) return 0;
+    if (g_path_load_error || n < 2 || n != (int)g_path_expected) return 0;
+
+    float total_len = 0.0f;
+    for (int i = 0; i < n - 1; i++) {
+        float dx = g_path_pts[i+1].x - g_path_pts[i].x;
+        float dy = g_path_pts[i+1].y - g_path_pts[i].y;
+        total_len += move_sqrt(dx * dx + dy * dy);
+    }
+    uint32_t path_timeout_ms = MOVE_WP_TIMEOUT_MS;
+    if (speed > 0.01f && total_len > 0.001f) {
+        uint32_t dyn_to = (uint32_t)((total_len / speed) * 3000.0f) + 5000UL;
+        if (dyn_to > path_timeout_ms) path_timeout_ms = dyn_to;
+    }
 
     g_move_active = 1;
     enc_has_last = false;
 
     const PathPt_t *p = g_path_pts;
     int seg = 0;                          /* 当前线段: p[seg]→p[seg+1] */
+    float path_hold_yaw = move_yaw;        /* path平移阶段保持起始航向, 防切线转头导致蛇形震荡 */
 
     uint32_t t0 = move_tick();
     uint32_t prev_iter_tick = t0;
 
     for (;;) {
-        if (move_tick() - t0 >= MOVE_WP_TIMEOUT_MS) {
+        if (move_tick() - t0 >= path_timeout_ms) {
             Move_Stop(); move_sync_to_odom(); g_move_active = 0;
             return 0;
         }
-        if (move_tick() - g_imu_last_tick > MOVE_IMU_TIMEOUT_MS) {
-            Move_Stop(); move_sync_to_odom(); g_move_active = 0;
-            return 0;
-        }
-
         /* 1. 读编码器 → 里程计 */
         int32_t cur_pos[4];
         dbg_enc_ok = move_read_all_encoders(cur_pos);
@@ -1290,17 +1433,32 @@ uint8_t MovePathTrack(void)
         float sdy = p[seg+1].y - p[seg].y;
         float slen2 = sdx * sdx + sdy * sdy;
 
-        /* 退化段(零长度)跳过, 否则t永=0→段切换卡死 */
-        if (slen2 < 1e-8f && seg < n - 2) { seg++; continue; }
-
         float t = 0.0f;
-        if (slen2 > 1e-8f) {
+        if (slen2 < 1e-8f) {
+            if (seg < n - 2) { seg++; continue; }
+            t = 1.0f;  /* 终点退化段: 直接进入终点收敛/航向检查 */
+        } else {
             float rxr = rx - p[seg].x, ryr = ry - p[seg].y;
             t = (rxr * sdx + ryr * sdy) / slen2;  /* [0=起点, 1=终点] */
         }
 
-        /* 3. 投影超过末端 → 切下一段 (不停车) */
+        /* 3. 普通通过点: 进入通过半径或投影越过端点即切下一段, 不停车 */
         if (t >= 1.0f && seg < n - 2) {
+            if (p[seg+1].mode == PATH_MODE_NORMAL) {
+                seg++;
+                continue;
+            }
+        }
+        if (seg < n - 2 && p[seg+1].mode == PATH_MODE_NORMAL) {
+            float nx = p[seg+1].x - rx;
+            float ny = p[seg+1].y - ry;
+            if (move_sqrt(nx * nx + ny * ny) <= MOVE_WP_PASS_RADIUS) {
+                seg++;
+                continue;
+            }
+        } else if (t >= 1.0f && seg < n - 2) {
+            /* 中间关键点保留为“减速通过点”: 不在单条path内停等上位机动作。
+             * 需要取放/识别停稳时, 应把路线拆成多条path, 让关键点作为终点。 */
             seg++;
             continue;
         }
@@ -1311,8 +1469,26 @@ uint8_t MovePathTrack(void)
             float exx = p[n-1].x - rx, eyy = p[n-1].y - ry;
             float dist_end = move_sqrt(exx * exx + eyy * eyy);
             if (dist_end <= MOVE_WP_END_TOL) {
-                Move_Stop(); move_sync_to_odom(); g_move_active = 0;
-                return 1;
+                Move_Stop();
+                move_sync_to_odom();
+                if (p[n-1].mode != PATH_MODE_KEY) {
+                    g_move_active = 0;
+                    return 1;
+                }
+
+                float final_yaw_err = p[n-1].target_theta - move_yaw;
+                while (final_yaw_err >  180.0f) final_yaw_err -= 360.0f;
+                while (final_yaw_err < -180.0f) final_yaw_err += 360.0f;
+                if (move_abs(final_yaw_err) <= MOVE_YAW_ACCEPT_DEG) {
+                    g_move_active = 0;
+                    return 1;
+                }
+
+                enc_has_last = false;
+                uint8_t rot_ok = RotateTo(p[n-1].target_theta, MOVE_YAW_TURN_LIMIT);
+                move_sync_to_odom();
+                g_move_active = 0;
+                return rot_ok;
             }
             t = 1.0f;      /* 钳位: 横向误差 = 机器人→终点 */
             at_end = 1;     /* 路径已尽: 停前进, 只靠横向修正收敛 */
@@ -1359,18 +1535,16 @@ uint8_t MovePathTrack(void)
 
         /* 7. 横向修正: ∝误差, 方向指向路径 */
         float vl = elen * MOVE_WP_LAT_KP;
-        float vl_cap = at_end ? (speed * 0.5f) : (vf * 0.5f);
+        float vl_cap = at_end ? MOVE_WP_SETTLE_MAX_SPEED : (vf * MOVE_WP_LAT_MAX_RATIO);
         if (vl > vl_cap) vl = vl_cap;
         float inv_el = (elen > 0.001f) ? (1.0f / elen) : 0.0f;
 
         float vx_f = vf * tx - vl * ex * inv_el;  /* 前进 + 向路径修正 */
         float vy_f = vf * ty - vl * ey * inv_el;
 
-        /* 8. 姿态控制 (调用独立函数 path_heading_ctrl) */
-        float wz = path_heading_ctrl(p, seg, sdx, sdy, vf, slen, at_end, move_yaw);
-        float target_yaw = (p[seg+1].mode == PATH_MODE_KEY)
-                           ? p[seg+1].target_theta
-                           : atan2f(sdx, sdy) * (180.0f / 3.14159265f);
+        /* 8. 姿态控制: 移动中只保持起始航向, 不跟随折线路径切线转头 */
+        float wz = path_yaw_hold_ctrl(path_hold_yaw, move_yaw);
+        float target_yaw = path_hold_yaw;
 
         /* 9. 发送 */
         uint32_t now_iter = move_tick();

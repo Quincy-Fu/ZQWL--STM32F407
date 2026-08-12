@@ -43,10 +43,10 @@ CubeMX 保留 USER CODE 区内容时，如果原文件是 UTF-8 而 CubeMX 写�
 - `variable "i" was declared but never referenced`（声明被乱码打断）
 
 **规避**：
-- USER CODE 区的注释尽量用英文（或 ASCII），避免中文
-- 必须中文时，CubeMX 重新生成后要检查文件编码（VSCode 右下角看编码，UTF-8 无 BOM 最稳）
+- 新增或修改注释统一使用中文；不要为了规避编码问题改成英文注释
+- CubeMX 重新生成后要检查文件编码（VSCode 右下角看编码，UTF-8 无 BOM 最稳）
 - 如果编译报奇怪 token 错误，先看是不是 USER CODE 区某行末尾混了乱码字节，用 `sed -n '<行号>p' file | cat -A` 看原始字节
-- 修复用 `sed -i '<行号>s|^.*<纯 ASCII 片段>.*|<纯 ASCII 行>|' file` 整行替换
+- 修复时整行替换为清晰中文注释或删除损坏注释，不要保留乱码字节
 
 ## 文件位置约定
 

@@ -45,11 +45,16 @@ void imu_protocol_process(void);
 /* 取最新 yaw (单位待实测: 弧度 or 角度) */
 bool imu_protocol_get_yaw(float *out);
 
+/* Reset yaw zeroing state and discard pending RX bytes.
+ * Use after IMU internal calibration so the next fresh Euler frame becomes 0 deg. */
+void imu_protocol_reset_yaw_zero(void);
+
 /* 调试变量 (Keil 在线调试器看) */
 extern volatile uint8_t  imu_last_func;          /* 最近一帧的功能码 */
 extern volatile uint32_t imu_frame_count;        /* 校验通过的帧计数 */
 extern volatile uint8_t  imu_last_checksum_ok;    /* 最近一帧校验结果 */
 extern volatile uint32_t imu_rx_byte_count;      /* 收到的总字节数 (调试用) */
 extern volatile float    imu_raw_yaw;            /* 原始 yaw (转换前, 确认单位用) */
+extern volatile uint32_t imu_return_state_count; /* IMU 命令完成/状态返回帧计数 */
 
 #endif /* __IMU_PROTOCOL_H */

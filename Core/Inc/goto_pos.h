@@ -31,7 +31,7 @@
 #define GOTO_CORRECT_TIMEOUT_MS 2000    /* 每轮超时 ms */
 
 /* 轴锁定 */
-#define GOTO_AXIS_LOCK_SPEED    0.015f  /* m/s 副轴纠正速度 */
+#define GOTO_AXIS_LOCK_SPEED    0.030f  /* m/s 副轴纠正速度 [0.015→0.03: 到位判定加副轴检查后需更快收尾] */
 #define GOTO_AXIS_LOCK_TOL      0.008f  /* m 副轴允许漂移量 */
 #define GOTO_AXIS_LOCK_MAX      1       /* 轴锁定后追加补偿轮数 */
 

@@ -33,9 +33,11 @@
 #include "uart_protocol.h"
 #include "move.h"
 #include "goto_pos.h"
-#include "oflow.h"
+#include "oflow.h"          /* 光流模块总开关 OFLOW_ENABLE (当前停用) */
+#if OFLOW_ENABLE
 #include "pmw3901.h"
 #include "oflow_calib.h"
+#endif
 #include "xpt2046.h"
 #include "light.h"
 #include "tim.h"
@@ -56,8 +58,8 @@
 // ===== Mecanum chassis geometry (measured, edit here) =====
 #define WHEEL_DIAMETER_M       0.065f    // wheel diameter 65mm
 #define WHEEL_RADIUS_M         (WHEEL_DIAMETER_M * 0.5f)
-#define WHEEL_BASE_HALF_X_M    0.085f    // half wheelbase (front-rear) 85mm
-#define WHEEL_BASE_HALF_Y_M    0.085f    // half track width 85mm
+#define WHEEL_BASE_HALF_X_M    0.085f    // 半轴距(前后)85mm
+#define WHEEL_BASE_HALF_Y_M    0.083f    // 半轮距(左右)83mm
 #define L_SUM_M                (WHEEL_BASE_HALF_X_M + WHEEL_BASE_HALF_Y_M)
 
 // Unit conversion: m/s -> wheel RPM
@@ -73,6 +75,9 @@
 // IMU verification
 #define IMU_VERIFY_FRAMES      10     // min valid frames to confirm IMU OK
 #define IMU_VERIFY_TIMEOUT     10000  // timeout (ms)
+#define IMU_CALIB_TIMEOUT_MS   8000   // gyro/accel calibration may take up to ~7s
+#define IMU_CALIB_FRAME_WAIT_MS 1000  // wait for Euler frames to resume after calibration
+#define IMU_CALIB_ON_BOOT      0      // set to 0 after this one-time zero-bias calibration
 
 // ===== 5th motor: 5-slot position actuator (like a servo, CAN addr 0x05) =====
 // 16 microstep -> 3200 pulses/rev (vendor example), 5 slots x 72 deg = 360 deg
@@ -83,6 +88,7 @@
 #define POS_MOVE_VEL_RPM       1000   // slot-to-slot move speed (RPM)
 #define POS_MOVE_ACC           10     // acceleration gear (0 = direct start)
 #define POS_HOME_WAIT_MS       2500   // wait for power-on homing to complete
+#define POS_MOTOR_ENABLE_ON_BOOT 1   // 0=temporary zero-set mode: leave turntable motor disabled
 /* 响应等待估算 (PosMotorTask 只发不收 CAN, 无真实到位信号, 只能按时间估算):
  * 1000RPM = 6000°/s 巡航, 单槽 72° 纯巡航仅 ~12ms, 加减速+定位整定为主要开销 */
 #define POS_RESP_BASE_MS       200u   // 基础: 加减速+定位整定开销
@@ -114,16 +120,16 @@ volatile float g_tgt_omega = 0.0f;   // CW+
 // ===== Odometry output (THE core result) =====
 // Updated by OdomTask (standby) / Move module (active), read by CommTask / DisplayTask
 // Blu3 field frame, origin = power-on position & heading
-//   x: right (m), y: forward (m), theta: CCW heading (rad) = g_imu_yaw
+//   x: right (m), y: forward (m), theta: CW+ heading (rad) = move_yaw
 volatile float g_odom_x     = 0.0f;   // position x (m), right+
 volatile float g_odom_y     = 0.0f;   // position y (m), forward+
-volatile float g_odom_theta = 0.0f;   // heading (rad), CCW positive
+volatile float g_odom_theta = 0.0f;   // heading (rad), CW positive
 
-// ===== IMU yaw (internal, used by OdomTask) =====
-// Unit: degrees (imu_protocol.c converts raw rad -> deg), CCW positive
-// Zero at power-on heading
+// ===== IMU yaw: 仅用于诊断/校准，运动角度闭环使用编码器 yaw =====
+// 单位: 度(imu_protocol.c将原始rad转为deg); 原始正方向由IMU安装方向决定
+// 运动角度闭环全程使用编码器yaw; IMU yaw仅保留诊断/校准用
 volatile float g_imu_yaw = 0.0f;
-volatile float g_imu_yaw_raw = 0.0f;   /* 无LPF原始值, 弧线swept_imu/停止预测用 (防滤波滞后) */
+volatile float g_imu_yaw_raw = 0.0f;   /* 无LPF原始值, 诊断/校准用 */
 volatile uint32_t g_imu_last_tick = 0;   /* xTaskGetTickCount of last yaw update */
 
 // IMU status: 1 = verified OK
@@ -149,6 +155,9 @@ volatile uint32_t g_vision_nudge_tick   = 0;   /* 最近一次微调命令的 ti
 // USART6 mutex: protects concurrent HAL_UART_Transmit between CommTask and NavTask
 osMutexId Uart6MutexHandle;
 
+// CAN发送互斥: 串行化所有Emm_V5命令，避免多任务并发插帧
+osMutexId CanTxMutexHandle;
+
 // �????�???? CubeMX-managed handles that we also reference in USER CODE �????�????
 // These MUST be here (not in CubeMX area) to survive code regeneration.
 osMessageQId DataQueueHandle;
@@ -162,15 +171,18 @@ extern volatile uint8_t  g_light_pending_on;
 extern volatile uint8_t  g_light_pending;
 extern volatile uint8_t  g_rotate_pending_pos;
 extern volatile uint8_t  g_rotate_pending;
+extern volatile uint8_t  g_set_zero_pending;
 extern volatile uint8_t  g_arm_pending;
 extern volatile uint8_t  g_arm_state;
 
 // 偏心标定诊断 (定义�?? oflow_calib.c)
+#if OFLOW_ENABLE
 extern volatile int32_t  calib_dbg_dx;
 extern volatile int32_t  calib_dbg_dy;
 extern volatile uint8_t  calib_dbg_squal;
 extern volatile uint8_t  calib_dbg_obs;
 extern volatile float    calib_dbg_total_deg;
+#endif
 /* USER CODE END Variables */
 osThreadId defaultTaskHandle;
 osThreadId MotorTaskHandle;
@@ -189,6 +201,7 @@ osThreadId PathTestTaskHandle;
 // Signed RPM -> Emm_V5 velocity command (dir + abs vel)
 // is_right: right-side motors mirror-mounted, positive RPM -> dir=1(CCW)
 static void motor_emit(uint8_t addr, float rpm_signed, bool is_right);
+static void pos_motor_home_to_slot0(void);
 
 // CommTask / upper-PC communication
 void StartCommTask(void const * argument);
@@ -245,6 +258,8 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN RTOS_MUTEX */
   osMutexDef(Uart6Mutex);
   Uart6MutexHandle = osMutexCreate(osMutex(Uart6Mutex));
+  osMutexDef(CanTxMutex);
+  CanTxMutexHandle = osMutexCreate(osMutex(CanTxMutex));
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
@@ -349,9 +364,9 @@ void StartTask02(void const * argument)
   /* USER CODE BEGIN StartTask02 */
 
   // Enable 4 motor drivers
-  Emm_V5_En_Control(MOTOR_FL, true, false); osDelay(10);
-  Emm_V5_En_Control(MOTOR_FR, true, false); osDelay(10);
-  Emm_V5_En_Control(MOTOR_RL, true, false); osDelay(10);
+  Emm_V5_En_Control(MOTOR_FL, true, false); osDelay(20);
+  Emm_V5_En_Control(MOTOR_FR, true, false); osDelay(20);
+  Emm_V5_En_Control(MOTOR_RL, true, false); osDelay(20);
   Emm_V5_En_Control(MOTOR_RR, true, false); osDelay(100);
 
   // Wait for motor driver initialization
@@ -530,17 +545,22 @@ void StartOdomTask(void const * argument)
           float dx_body = (d_FL - d_FR - d_RL + d_RR) * 0.25f;  // right
           float dy_body = (d_FL + d_FR + d_RL + d_RR) * 0.25f;  // forward
 
-          // Heading from IMU (g_imu_yaw in degrees -> radians for trig)
-          float theta = g_imu_yaw * 0.01745329f;
+          // Heading from encoder odometry (CW+ deg -> rad). Keep this
+          // consistent with move.c move_update_odom for idle tracking.
+          float dtheta_cw = ((d_FL - d_FR + d_RL - d_RR) * 0.25f) / MOVE_YAW_L_SUM * 57.2957795f;
+          __disable_irq();
+          move_yaw += dtheta_cw;
+          float theta = move_yaw * 0.01745329f;   // CW+ rad
+          __enable_irq();
 
-          // Rotate body -> world frame (X=right, Y=forward, theta=CCW)
+          // Rotate body -> world frame (X=right, Y=forward, theta=CW+)
           // Same rotation as move.c move_update_odom
           float ct = cosf(theta);
           float st = sinf(theta);
           __disable_irq();
           g_odom_x     += dx_body * ct + dy_body * st;   // right
           g_odom_y     += -dx_body * st + dy_body * ct;  // forward
-          g_odom_theta  = theta;
+          g_odom_theta  = theta;                         // CW+ rad
           __enable_irq();
         }
       }
@@ -570,9 +590,17 @@ void StartOdomTask(void const * argument)
 void StartOptFlowTask(void const * argument)
 {
   /* USER CODE BEGIN StartOptFlowTask */
+#if OFLOW_ENABLE
 
   // PMW3901 光流处理: 初始化传感器 �????? 10ms 采样 �????? 偏心补偿 �????? 独立里程�?????
   OFlow_TaskLoop();
+
+#else
+  /* 光流全局停用: 任务创建后立即自删除, 不触碰 PMW3901.
+   * 重新启用: oflow.h 中 OFLOW_ENABLE 改为 1 */
+  (void)argument;
+  vTaskDelete(NULL);
+#endif
 
   /* USER CODE END StartOptFlowTask */
 }
@@ -600,10 +628,21 @@ void StartImuTask(void const * argument)
   imu_uart_set_6axis();
   osDelay(100);  // wait for internal mode switch
 
-  /* 临时: 重新校准�?螺仪零偏 (保持静止, �?7�?)
-   * 校准已完�?, 注释掉避免每次开机等7�? */
-  /* imu_uart_calibrate_imu(); */
-  /* osDelay(7000); */
+#if IMU_CALIB_ON_BOOT
+  /* One-time boot calibration: keep the robot fully stationary.
+   * After calibration, reset yaw-zero state so the first fresh post-calibration
+   * Euler frame becomes the 0-deg heading. Set IMU_CALIB_ON_BOOT to 0 afterward. */
+  uint32_t boot_ret_before = imu_return_state_count;
+  imu_uart_calibrate_imu();
+  uint32_t boot_calib_t0 = xTaskGetTickCount();
+  while ((xTaskGetTickCount() - boot_calib_t0) < pdMS_TO_TICKS(IMU_CALIB_TIMEOUT_MS)) {
+    imu_protocol_process();
+    if (imu_return_state_count != boot_ret_before) break;
+    osDelay(20);
+  }
+  imu_protocol_reset_yaw_zero();
+  osDelay(100);
+#endif
 
   /* �????�???? �????阶低通滤�????: 平滑IMU噪声, 防止角度环振�???? �????�????
    * IMU输出25Hz, alpha=0.5 �???? 时间常数�????58ms
@@ -628,7 +667,7 @@ void StartImuTask(void const * argument)
       }
       __disable_irq();
       g_imu_yaw = yaw_filtered;
-      g_imu_yaw_raw = yaw;      /* 无LPF, 供弧线停止预测 */
+      g_imu_yaw_raw = yaw;      /* 无LPF, 诊断/校准用 */
       g_imu_last_tick = xTaskGetTickCount();
       __enable_irq();
     }
@@ -655,11 +694,13 @@ void StartDisplayTask(void const * argument)
 {
   /* USER CODE BEGIN StartDisplayTask */
   extern volatile uint32_t g_rx_nav_count;
+#if OFLOW_ENABLE
   // Optical flow globals from oflow.h
   extern volatile float oflow_x, oflow_y, oflow_vx, oflow_vy;
   extern volatile float oflow_squal_avg;
   extern volatile uint32_t oflow_valid_count, oflow_invalid_count;
   extern volatile uint8_t oflow_sensor_ok;
+#endif
 
   // Encoder diagnostics from move.c
   extern volatile int32_t dbg_enc_raw[4];
@@ -692,20 +733,23 @@ void StartDisplayTask(void const * argument)
     // �?????�????? snapshot all shared variables �?????�?????
     float ox, oy, iy;
     uint8_t imu_ok, mact;
+#if OFLOW_ENABLE
     float ofx, ofy, ofvx, ofvy, ofsq;
     uint32_t ofok, ofbad;
     uint8_t ofsen;
-    uint8_t tg, homed;
-    uint32_t pcnt;
     uint16_t pmw_shut;
     uint8_t pmw_led;
+#endif
+    uint8_t tg, homed;
+    uint32_t pcnt;
 
     __disable_irq();
     ox = g_odom_x;
     oy = g_odom_y;
-    iy = g_imu_yaw;
+    iy = move_yaw;   /* 当前航向 CW+度: 全程编码器 */
     imu_ok = g_imu_verified;
     mact = g_move_active;
+#if OFLOW_ENABLE
     ofx = oflow_x;
     ofy = oflow_y;
     ofvx = oflow_vx;
@@ -716,6 +760,7 @@ void StartDisplayTask(void const * argument)
     ofsen = oflow_sensor_ok;
     pmw_shut = pmw_last_shutter;
     pmw_led = pmw_led_readback;
+#endif
     tg = g_target_gear;
     homed = g_pos_homed;
     pcnt = g_pos_cmd_count;
@@ -754,6 +799,7 @@ void StartDisplayTask(void const * argument)
     // separator
     LCD_Print(4, 82, "------------------------------", LCD_GRAY, LCD_BLACK);
 
+#if OFLOW_ENABLE
     // ════════════════════════════════════════
     //  Section 2: OPTICAL FLOW  (y = 100 ~ 200)
     // ════════════════════════════════════════
@@ -778,6 +824,7 @@ void StartDisplayTask(void const * argument)
 
     // separator
     LCD_Print(4, 202, "------------------------------", LCD_GRAY, LCD_BLACK);
+#endif /* OFLOW_ENABLE */
 
     // ════════════════════════════════════════
     //  Section 3: TURNTABLE  (y = 220 ~ 300)
@@ -787,7 +834,7 @@ void StartDisplayTask(void const * argument)
     snprintf(buf, sizeof(buf), "SLOT: %d (%3d DEG)", (int)tg, (int)tg * 72);
     LCD_Print(4, 240, buf, LCD_WHITE, LCD_BLACK);
 
-    snprintf(buf, sizeof(buf), "HOME:%s  CMD:%lu",
+    snprintf(buf, sizeof(buf), "HOME:%s CMD:%lu",
              homed ? "OK" : "WAIT", (unsigned long)pcnt);
     LCD_Print(4, 260, buf, homed ? LCD_GREEN : LCD_RED, LCD_BLACK);
 
@@ -856,7 +903,7 @@ void StartDisplayTask(void const * argument)
           __disable_irq();
           g_odom_x = 0.0f; g_odom_y = 0.0f;
           __enable_irq();
-          Move_InitPose(0.0f, 0.0f, g_imu_yaw);
+          Move_InitPose(0.0f, 0.0f, Move_GetYaw());
         }
       } else { btn_sync_held = 0; }
       LCD_Print(4, 370, "[SYNC 0,0]   ", c1, LCD_BLACK);
@@ -1010,11 +1057,11 @@ void StartServoTask(void const * argument)
   // State lookup: 0 = power-on default pose, 1-7 = arm poses
   // {servo1_angle, servo2_angle} in degrees (0-270)
   static const uint16_t arm_poses[8][2] = {
-      {170,  115},  // [0] power-on default pose
-      {50, 145},  // [1] state 1 - TODO
-      {135, 135},  // [2] state 2 - TODO
-      {135, 135},  // [3] state 3 - TODO
-      {135, 135},  // [4] state 4 - TODO
+      {190,  85},  // [0] power-on default pose  归位
+      {65, 145},  // [1] state 1 - TODO  圆柱体
+      {65, 145},  // [2] state 2 - TODO  奖杯地面
+      {130, 200},  // [3] state 3 - TODO 奖杯亚军
+      {135, 135},  // [4] state 4 - TODO 奖杯冠军
       {135, 135},  // [5] state 5 - TODO
       {135, 135},  // [6] state 6 - TODO
       {135, 135},  // [7] state 7 - TODO
@@ -1116,9 +1163,11 @@ void StartLightTask(void const * argument)
       uint8_t id = g_light_pending_id;
       uint8_t bright = g_light_pending_on ? 100 : 0;
       if (id == 0) {
-        Light_SetAll(bright);
+        Light_SetCommLights(bright);          /* 2/3/4 整体开关 (PB4常亮不受影响) */
+      } else if (id == 1) {
+        /* PB4 常亮灯, 通信不控制, 仅回响应 */
       } else {
-        Light_SetBright(id, bright);
+        Light_SetBright(id, bright);          /* 2/3/4 单灯, 只支持0/100 */
       }
       g_light_pending = 0;
       SendNavResultToPC(TYPE_LIGHT_RESP, 1);   /* 已执行, 回响应 */
@@ -1144,50 +1193,68 @@ void StartPosMotorTask(void const * argument)
 
   // 软件使能: 与轮子电机一致, 每次上电都发, 不依赖面板自锁设置.
   // 面板自锁可能掉电后丢失; 软件使能确保每次上电都处于使能状态.
-  Emm_V5_En_Control(POS_MOTOR_ADDR, true, false);
+#if POS_MOTOR_ENABLE_ON_BOOT
+  pos_motor_home_to_slot0();
+#else
+  // 临时零点设置模式：关闭第 5 电机使能，方便手动摆正转盘。
+  Emm_V5_En_Control(POS_MOTOR_ADDR, false, false);
   osDelay(30);
-
-  // Trigger single-turn nearest homing: motor returns to the saved origin (= slot 0).
-  // The origin must have been set+saved ONCE at install time: align the mechanism
-  // to slot 0, then via vendor host PC -> O_Set -> Set O (save). See manual 7.1.
-  // The driver's position counter resets on power-off, so this homing re-establishes
-  // the absolute reference at every power-on. Homing move is <=180 deg at 30 RPM
-  // -> completes in <=~1s; we wait longer as a safe margin.
-  Emm_V5_Origin_Trigger_Return(POS_MOTOR_ADDR, 0 /*nearest*/, 0 /*no sync*/);
-
-  // Wait for homing to finish. This task is SEND-ONLY (never reads CAN responses)
-  // to avoid contending with OdomTask over the single shared RX buffer (can.rxData).
-  osDelay(POS_HOME_WAIT_MS);
-
-  g_pos_homed = 1;  // homing done
+  g_pos_homed = 0;
+#endif
+#if POS_MOTOR_ENABLE_ON_BOOT
   uint8_t cur_gear = 0;  // after homing the mechanism is at slot 0
+#endif
 
   for(;;) {
+    /* 转盘零点设置: 将当前位置存为零点并写入 flash (一次性标定) */
+    if (g_set_zero_pending) {
+      g_set_zero_pending = 0;
+      Emm_V5_Origin_Set_O(POS_MOTOR_ADDR, true);  /* svF=true: 写入 flash, 掉电不丢 */
+      osDelay(100);  /* 等待 CAN 帧发送 + 驱动器写入 flash */
+      Emm_V5_Reset_CurPos_To_Zero(POS_MOTOR_ADDR);  /* 当前机械位就是slot0, 同步绝对位置计数 */
+      osDelay(30);
+#if POS_MOTOR_ENABLE_ON_BOOT
+      cur_gear = 0;
+      g_target_gear = 0;
+      g_pos_homed = 1;
+#endif
+      SendNavResultToPC(TYPE_CMD_SET_ZERO_RESP, 1);
+      continue;  /* 跳过本轮 rotate 检查, 下一轮再处理 */
+    }
+
     if (g_rotate_pending) {
       uint8_t tgt = g_rotate_pending_pos;
       g_rotate_pending = 0;
 
+#if !POS_MOTOR_ENABLE_ON_BOOT
+      SendNavResultToPC(TYPE_ROTATE_RESP, 0);
+#else
       if (tgt < POS_SLOT_COUNT) {
         uint8_t delta = (tgt > cur_gear) ? (tgt - cur_gear) : (cur_gear - tgt);
 
-        if (delta > 0) {
-          // Absolute position move to slot tgt (= tgt * 72 deg from origin).
-          // 13 bytes -> 2 CAN frames via can_SendCmd (with HAL_Delay(10) between frames).
-          // No critical section: motor addr 0x05 differs from OdomTask's 0x01-0x04,
-          // so CAN frame interleaving is harmless.
-          Emm_V5_Pos_Control(POS_MOTOR_ADDR, 0 /*CW*/, POS_MOVE_VEL_RPM, POS_MOVE_ACC,
+        if (tgt == 0) {
+          /* 回0槽必须触发驱动器回零, 不能只看软件cur_gear。
+           * 若上电回零失败或手动动过转盘, cur_gear可能仍为0但机械位置已偏。 */
+          pos_motor_home_to_slot0();
+          cur_gear = 0;
+        } else if (delta > 0) {
+          // 绝对位置切槽: 目标槽 = 已保存零点 + tgt * 72度。
+          // 13字节命令会拆成2帧CAN，can_SendCmd内部负责帧间延时。
+          // CAN发送由can_SendCmd内部互斥保护，避免多任务并发插帧。
+          Emm_V5_Pos_Control(POS_MOTOR_ADDR, 0 /* 顺时针 */, POS_MOVE_VEL_RPM, POS_MOVE_ACC,
                              (uint32_t)tgt * POS_PULSES_PER_SLOT,
-                             true  /*absolute*/,
-                             false /*no sync*/);
+                             true  /* 绝对位置 */,
+                             false /* 不同步 */);
           cur_gear = tgt;
           g_pos_cmd_count++;
-          osDelay(30);  // post-command cooldown: let motor driver process
+          osDelay(30);  // 命令后短暂等待，让驱动器处理
           // 估算移动时间后回响应 (无真实到位信号): 基础开销 + 每槽余量
           osDelay(POS_RESP_BASE_MS + (uint32_t)delta * POS_RESP_PER_SLOT_MS);
         }
-        /* delta==0: 已在目标槽, 立即回响应 */
+        /* 命令已下发、回零流程已执行或本来就在目标槽，回响应。 */
         SendNavResultToPC(TYPE_ROTATE_RESP, 1);
       }
+#endif
     }
 
     osDelay(20);
@@ -1214,6 +1281,21 @@ void StartTask10(void const * argument)
 /* USER CODE BEGIN Application */
 
 extern UART_HandleTypeDef huart6;
+
+static void pos_motor_home_to_slot0(void)
+{
+  /* 上电/MCU reset 后统一回到 0 档。
+   * 零点需要先通过 set_zero 保存到驱动器 flash。 */
+  Emm_V5_En_Control(POS_MOTOR_ADDR, true, false);
+  osDelay(30);
+
+  Emm_V5_Origin_Trigger_Return(POS_MOTOR_ADDR, 0 /* 单圈就近回零 */, false /* 不同步 */);
+  osDelay(POS_HOME_WAIT_MS);
+
+  g_target_gear = 0;
+  g_pos_cmd_count++;
+  g_pos_homed = 1;
+}
 
 // NavTask: blocking navigation command execution (Stage 3)
 // Receives NavPacket_t from ISR via NavQueue, calls Move/Goto layer,
@@ -1250,6 +1332,8 @@ void StartNavTask(void const * argument)
           break;
 
         case NAV_CMD_FINE_MOVE: {
+          Move_Stop();
+          g_vision_nudge_active = 0;
           float tx = move_x + nav.f[0] * 0.001f;
           float ty = move_y + nav.f[1] * 0.001f;
           result = MoveToAccurateTimed(tx, ty, GOTO_CORRECT_SPEED,
@@ -1258,15 +1342,17 @@ void StartNavTask(void const * argument)
           break;
         }
 
-        case NAV_CMD_SYNC_POSE:
-          Move_InitPose(nav.f[0], nav.f[1], g_imu_yaw);
+        case NAV_CMD_SYNC_POSE: {
+          float sync_yaw = (nav.f[4] > 0.5f) ? nav.f[2] : Move_GetYaw();
+          Move_InitPose(nav.f[0], nav.f[1], sync_yaw);
           SendNavResultToPC(TYPE_CMD_SYNC_RESP, 1);
           break;
+        }
 
         case NAV_CMD_ARC: {
           /* 新圆弧语义: 从当前位姿出发, 圆心自动算 (MoveArcTrack).
            * f[0]=半径m, f[1]=方向(+1右转/-1左转), f[2]=扫过角度°, f[3]=速度(0=默认).
-           * 航向始终沿切线(车头朝前), 软启动+末端减速+IMU停止预测. */
+           * 航向始终沿切线(车头朝前), 软启动+末端减速+编码器角速度停止预测. */
           float arc_r     = nav.f[0];
           int   arc_dir   = (nav.f[1] >= 0.0f) ? 1 : -1;
           float arc_sweep = nav.f[2];
@@ -1287,6 +1373,42 @@ void StartNavTask(void const * argument)
           HAL_GPIO_WritePin(GPIOD, GPIO_PIN_15, GPIO_PIN_RESET);
           SendNavResultToPC(TYPE_RUN_RESP, 1);
           break;
+
+        case NAV_CMD_IMU_CALIB: {
+          /* IMU gyro/accel zero-bias calibration. Vehicle must be stationary.
+           * Preserve external yaw (CW+) across the IMU internal calibration so
+           * odometry/command yaw does not jump after calibration. */
+          Move_Stop();
+          g_vision_nudge_active = 0;
+
+          float keep_x = move_x;
+          float keep_y = move_y;
+          float keep_yaw = Move_GetYaw();
+          uint32_t ret_before = imu_return_state_count;
+          uint32_t imu_tick_before = g_imu_last_tick;
+
+          imu_uart_calibrate_imu();
+
+          uint32_t t0 = xTaskGetTickCount();
+          while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(IMU_CALIB_TIMEOUT_MS)) {
+            if (imu_return_state_count != ret_before) break;
+            osDelay(20);
+          }
+
+          uint32_t t1 = xTaskGetTickCount();
+          while ((g_imu_last_tick == imu_tick_before) &&
+                 ((xTaskGetTickCount() - t1) < pdMS_TO_TICKS(IMU_CALIB_FRAME_WAIT_MS))) {
+            osDelay(20);
+          }
+
+          uint8_t fresh = ((g_imu_last_tick != imu_tick_before) &&
+                           ((xTaskGetTickCount() - g_imu_last_tick) <= pdMS_TO_TICKS(MOVE_IMU_TIMEOUT_MS))) ? 1u : 0u;
+          if (fresh) {
+            Move_InitPose(keep_x, keep_y, keep_yaw);
+          }
+          SendNavResultToPC(TYPE_CMD_IMU_CALIB_RESP, fresh);
+          break;
+        }
 
         case NAV_CMD_PATH:
           result = MovePathTrack();
@@ -1314,6 +1436,7 @@ void StartNavTask(void const * argument)
           break;
         }
 
+#if OFLOW_ENABLE
         case NAV_CMD_CALIB_HEIGHT: {
           /* 挂起OptFlowTask: cal_wait_done直接读PMW3901, 防SPI1竞争 */
           if (OptFlowTaskHandle) vTaskSuspend(OptFlowTaskHandle);
@@ -1376,6 +1499,16 @@ void StartNavTask(void const * argument)
           }
           break;
         }
+#else
+        case NAV_CMD_CALIB_HEIGHT:
+          /* 光流模块已停用 (OFLOW_ENABLE=0): 不接受标定命令, 回失败 */
+          SendNavResultToPC(TYPE_CMD_CALIB_HEIGHT_RESP, 0);
+          break;
+
+        case NAV_CMD_CALIB_OFFSET:
+          SendNavResultToPC(TYPE_CMD_CALIB_OFFSET_RESP, 0);
+          break;
+#endif /* OFLOW_ENABLE */
 
         case NAV_CMD_VISION_NUDGE: {
           /* 视觉微调: 到位后视觉闭环方向微调 (体坐标系, 非阻塞)
@@ -1402,6 +1535,24 @@ void StartNavTask(void const * argument)
             g_vision_nudge_tick   = xTaskGetTickCount();
           }
           SendNavResultToPC(TYPE_CMD_VISION_NUDGE_RESP, 1);
+          break;
+        }
+
+        case NAV_CMD_VISION_CORRECT: {
+          /* 视觉校正: fine_move (物理修正偏移) + sync_pose (重置坐标) 原子组合
+           * f[0]=dx_mm, f[1]=dy_mm: 视觉检测到的偏移, 物理移动修正
+           * f[2]=target_x, f[3]=target_y: 修正成功后重置odom到此绝对坐标
+           * 仅当 fine_move 成功才重置坐标, 消除累积漂移 */
+          Move_Stop();
+          g_vision_nudge_active = 0;
+          float tx = move_x + nav.f[0] * 0.001f;
+          float ty = move_y + nav.f[1] * 0.001f;
+          result = MoveToAccurateTimed(tx, ty, GOTO_CORRECT_SPEED,
+                                       GOTO_CORRECT_TOL, 2500);
+          if (result) {
+            Move_InitPose(nav.f[2], nav.f[3], Move_GetYaw());
+          }
+          SendNavResultToPC(TYPE_CMD_VISION_CORRECT_RESP, result);
           break;
         }
 
@@ -1466,11 +1617,11 @@ void StartCommTask(void const * argument)
     __disable_irq();
     px = g_odom_x;
     py = g_odom_y;
-    // Read IMU yaw directly (always current, even when stationary)
-    // g_imu_yaw is in degrees, CCW positive, zero at power-on
-    pt = g_imu_yaw * 0.01745329f;  // deg -> rad
+    /* 航向用全局里程计 (CW+弧度, 与控制环同源同约定):
+     * 当前运动控制全程使用编码器yaw。 */
+    pt = g_odom_theta;
     __enable_irq();
-    /* g_imu_yaw 内部刻意不解卷(累加值, 供LPF连续/弧线角度累计),
+    /* move_yaw 内部刻意不解卷(累加值), g_odom_theta 同样累加,
      * 上报前必须归一到 [-pi, pi), 否则上位机位姿显示 540/720 累加 */
     while (pt >  3.14159265f) pt -= 6.28318531f;
     while (pt < -3.14159265f) pt += 6.28318531f;

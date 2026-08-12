@@ -65,7 +65,6 @@ static UartParser_t uart6_parser;
 extern volatile uint8_t g_target_gear;
 
 volatile uint32_t g_rx_cmd_vel_count = 0;
-volatile uint32_t g_rx_rotate_count  = 0;
 volatile uint32_t g_rx_arm_count     = 0;
 volatile uint32_t g_rx_light_count   = 0;
 volatile uint32_t g_rx_nav_count     = 0;
@@ -78,6 +77,9 @@ volatile uint8_t g_light_pending    = 0;   // 1=new command pending
 // ROTATE command pending flag (consumed by PosMotorTask, 执行完回 TYPE_ROTATE_RESP)
 volatile uint8_t g_rotate_pending_pos = 0; // 目标槽位 0-4
 volatile uint8_t g_rotate_pending     = 0; // 1=new command pending
+
+// SET_ZERO command pending flag (consumed by PosMotorTask, 执行完回 TYPE_CMD_SET_ZERO_RESP)
+volatile uint8_t g_set_zero_pending   = 0; // 1=save current turntable pos as zero to flash
 
 // ARM command pending flag (consumed by ServoTask, 执行完回 TYPE_ARM_RESP)
 volatile uint8_t g_arm_pending = 0;        // 1=new command pending
@@ -108,7 +110,6 @@ static inline void dispatch_frame(uint8_t type, const uint8_t *payload, uint8_t 
             g_rotate_pending_pos = pos;   /* PosMotorTask 执行+回响应 */
             g_rotate_pending = 1;
         }
-        g_rx_rotate_count++;
     } else if (type == TYPE_ARM) {
         if (len >= 1) {
             uint8_t state = payload[0];
@@ -130,6 +131,15 @@ static inline void dispatch_frame(uint8_t type, const uint8_t *payload, uint8_t 
         BaseType_t h = pdFALSE;
         xQueueSendFromISR(NavQueueHandle, &nav, &h);
         portYIELD_FROM_ISR(h);
+    } else if (type == TYPE_CMD_SET_ZERO && len == 0) {
+        /* 转盘零点设置: PosMotorTask 消费此标志, 调 Emm_V5_Origin_Set_O(0x05, true) */
+        g_set_zero_pending = 1;
+    } else if (type == TYPE_CMD_IMU_CALIB && len == 0) {
+        NavPacket_t nav; nav.cmd = NAV_CMD_IMU_CALIB;
+        BaseType_t h = pdFALSE;
+        xQueueSendFromISR(NavQueueHandle, &nav, &h);
+        portYIELD_FROM_ISR(h);
+        g_rx_nav_count++;
     }
     // --- Navigation commands -> NavQueue (Stage 3) ---
     else if (type == TYPE_CMD_GOTO && len == 8) {
@@ -174,10 +184,17 @@ static inline void dispatch_frame(uint8_t type, const uint8_t *payload, uint8_t 
         portYIELD_FROM_ISR(h);
         g_rx_nav_count++;
     }
-    else if (type == TYPE_CMD_SYNC_POSE && len == 8) {
+    else if (type == TYPE_CMD_SYNC_POSE && (len == 8 || len == 12)) {
         NavPacket_t nav; nav.cmd = NAV_CMD_SYNC_POSE;
         memcpy(&nav.f[0], payload, 4);
         memcpy(&nav.f[1], payload + 4, 4);
+        if (len == 12) {
+            memcpy(&nav.f[2], payload + 8, 4);
+            nav.f[4] = 1.0f;
+        } else {
+            nav.f[2] = 0.0f;
+            nav.f[4] = 0.0f;
+        }
         BaseType_t h = pdFALSE;
         xQueueSendFromISR(NavQueueHandle, &nav, &h);
         portYIELD_FROM_ISR(h);
@@ -240,6 +257,19 @@ static inline void dispatch_frame(uint8_t type, const uint8_t *payload, uint8_t 
     else if (type == TYPE_CMD_VISION_NUDGE && len == 1) {
         NavPacket_t nav; nav.cmd = NAV_CMD_VISION_NUDGE;
         nav.f[0] = (float)payload[0];   /* direction: 0=stop+lock, 1=fwd, 2=back, 3=left, 4=right */
+        BaseType_t h = pdFALSE;
+        xQueueSendFromISR(NavQueueHandle, &nav, &h);
+        portYIELD_FROM_ISR(h);
+        g_rx_nav_count++;
+    }
+    // --- 视觉校正 (Stage 5: fine_move + sync_pose 原子组合) ---
+    else if (type == TYPE_CMD_VISION_CORRECT && len == 16) {
+        NavPacket_t nav; nav.cmd = NAV_CMD_VISION_CORRECT;
+        nav.f[0] = 0.0f; nav.f[1] = 0.0f; nav.f[2] = 0.0f; nav.f[3] = 0.0f;
+        memcpy(&nav.f[0], payload,      4);  /* dx_mm */
+        memcpy(&nav.f[1], payload + 4,  4);  /* dy_mm */
+        memcpy(&nav.f[2], payload + 8,  4);  /* target_x */
+        memcpy(&nav.f[3], payload + 12, 4);  /* target_y */
         BaseType_t h = pdFALSE;
         xQueueSendFromISR(NavQueueHandle, &nav, &h);
         portYIELD_FROM_ISR(h);

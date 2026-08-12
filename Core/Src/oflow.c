@@ -2,6 +2,14 @@
  * @file    oflow.c
  * @brief   光流处理模块 — OptFlowTask 主循环实现
  *
+ * ┌─────────────────────────────────────────────────────────────┐
+ * │ 当前状态: 已停用 (oflow.h 中 OFLOW_ENABLE = 0)              │
+ * │ 本模块及 oflow_calib.c / pmw3901.c 保留在工程中完整编译,    │
+ * │ 但 OptFlowTask 创建后立即自删除, 不初始化/不读取 PMW3901,   │
+ * │ 也不控制补光灯 (与 light 模块完全解耦).                     │
+ * │ 重新启用: 将 oflow.h 的 OFLOW_ENABLE 改为 1 即可整体恢复.   │
+ * └─────────────────────────────────────────────────────────────┘
+ *
  * 10ms 周期读 PMW3901 Motion Burst，做偏心补偿后积分到光流坐标。
  * 独立于编码器里程计运行，输出 oflow_x/y 供融合或监测。
  *
@@ -18,7 +26,6 @@
 #include "oflow.h"
 #include "pmw3901.h"
 #include "move.h"
-#include "light.h"
 #include "shared_vars.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -88,10 +95,9 @@ void OFlow_TaskLoop(void)
     }
     oflow_sensor_ok = 1;
 
-    /* 开启补光灯 (可见光, 给摄像头用).
-     * 注意: PMW3901 有 IR 滤光片, 只透 ~850nm, 可见光对它无效.
-     * 光流照明需靠 IR LED (ATK 模块 LED1 焊盘) 或足够环境光 (>60Lux). */
-    Light_SetAll(100);
+    /* 照明说明: PMW3901 有 IR 滤光片, 只透 ~850nm, 可见补光灯对它无效.
+     * 光流照明需靠 IR LED (ATK 模块 LED1 焊盘) 或足够环境光 (>60Lux).
+     * 补光灯由 light 模块独立管理, 本模块不控制 (已解耦). */
 
     /* 清零累计 */
     OFlow_Reset();

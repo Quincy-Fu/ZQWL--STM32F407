@@ -17,12 +17,12 @@
  *  freertos.c 定义
  * ================================================================ */
 
-/* IMU 航向 (度, CCW 正, 上电=0°) */
-extern volatile float g_imu_yaw;       /* LPF滤波后, 给航向控制/里程计用 */
-extern volatile float g_imu_yaw_raw;  /* 无LPF, 给弧线swept_imu用 */
+/* IMU 航向 (度, 上电=0°; 原始正方向由安装决定, move.c统一映射到CW正) */
+extern volatile float g_imu_yaw;       /* LPF滤波后, 诊断/校准用; 普通航向不依赖它 */
+extern volatile float g_imu_yaw_raw;  /* 无LPF, 诊断/校准用; 运动角度闭环不依赖它 */
 extern volatile uint8_t g_imu_verified;
 
-/* 里程计 (场坐标: x=右m, y=前m, theta=CCW rad) */
+/* 里程计 (场坐标: x=右m, y=前m, theta=CW+ rad, =move_yaw×π/180) */
 extern volatile float g_odom_x;
 extern volatile float g_odom_y;
 extern volatile float g_odom_theta;
@@ -48,6 +48,7 @@ extern osThreadId OptFlowTaskHandle;
 extern osMessageQId DataQueueHandle;
 extern osMessageQId NavQueueHandle;
 extern osMutexId    Uart6MutexHandle;
+extern osMutexId    CanTxMutexHandle;
 extern osThreadId   CommTaskHandle;
 
 /* ================================================================

@@ -51,6 +51,18 @@
 #define TYPE_CMD_VISION_NUDGE        0x27   // PC->MCU: payload 1B direction (0=stop+lock, 1=fwd, 2=back, 3=left, 4=right)
 #define TYPE_CMD_VISION_NUDGE_RESP   0x28   // MCU->PC: payload 1B status (1=executed)
 
+// 转盘零点设置 (一次性标定: 将当前位置存为零点并写入 flash)
+#define TYPE_CMD_SET_ZERO        0x29   // PC->MCU: payload 空, 调用 Emm_V5_Origin_Set_O(svF=true)
+#define TYPE_CMD_SET_ZERO_RESP   0x2A   // MCU->PC: payload 1B status (1=saved)
+
+// 视觉校正 (Stage 5: 弧后视觉闭环, fine_move + sync_pose 原子组合)
+#define TYPE_CMD_VISION_CORRECT        0x2B   // PC->MCU: 16B = field dx_mm + field dy_mm + target_x_m + target_y_m
+#define TYPE_CMD_VISION_CORRECT_RESP   0x2C   // MCU->PC: 1B status (1=arrived and odom synced, 0=move failed)
+
+// IMU 零偏校准 (车必须静止; MCU 转发 IMU 0x70 校准命令并等待完成)
+#define TYPE_CMD_IMU_CALIB             0x2D   // PC->MCU: payload 空
+#define TYPE_CMD_IMU_CALIB_RESP        0x2E   // MCU->PC: payload 1B status (1=IMU帧恢复)
+
 // ????payload?? (3?float)
 #define PAYLOAD_SIZE_VEL         12
 // ???payload?? (3?float)
@@ -97,15 +109,17 @@ bool UartParser_FeedByte(UartParser_t* parser, uint8_t byte, uint8_t* out_type, 
 #define NAV_CMD_TOY        0x03
 #define NAV_CMD_TURNTO     0x04
 #define NAV_CMD_FINE_MOVE  0x05
-#define NAV_CMD_SYNC_POSE  0x06
+#define NAV_CMD_SYNC_POSE  0x06   /* f[0]=x_m, f[1]=y_m, f[2]=yaw_deg(可选), f[4]=1 表示同步 yaw */
 #define NAV_CMD_ARC        0x07   /* 圆弧(MoveArcTrack): f[0]=半径m, f[1]=方向(+1右/-1左), f[2]=扫过角度°, f[3]=速度(0=默认) */
 #define NAV_CMD_CALIB_HEIGHT 0x08
 #define NAV_CMD_CALIB_OFFSET 0x09
 #define NAV_CMD_PATH       0x0A
 #define NAV_CMD_PATH_TEST  0x0B   /* 内置路径测试 (无线调试器触发, 实际走 NAV_CMD_PATH) */
-#define NAV_CMD_ARC_TRACK  0x0C   /* 圆弧轨迹跟踪: f[0]=radius, f[1]=speed, f[2]=dir(±1), f[3]=sweep_deg */
+#define NAV_CMD_ARC_TRACK  0x0C   /* 圆弧轨迹跟踪: f[0]=半径m, f[1]=速度m/s, f[2]=方向(±1), f[3]=扫过角度° */
 #define NAV_CMD_RUN        0x0D   /* 启动按键模拟: PD15 脉冲500ms, 无参数, 回复 TYPE_RUN_RESP */
 #define NAV_CMD_VISION_NUDGE 0x0E  /* 视觉微调: f[0]=direction(0=stop+lock,1=fwd,2=back,3=left,4=right) */
+#define NAV_CMD_VISION_CORRECT 0x0F /* f[0]=field dx_mm, f[1]=field dy_mm, f[2]=target_x_m, f[3]=target_y_m */
+#define NAV_CMD_IMU_CALIB  0x10   /* IMU gyro/accel zero-bias calibration, no params */
 
 typedef struct {
     uint8_t  cmd;

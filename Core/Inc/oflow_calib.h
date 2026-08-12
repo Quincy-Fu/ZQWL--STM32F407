@@ -2,6 +2,11 @@
  * @file    oflow_calib.h
  * @brief   光流标定模块 — 高度标定 + 偏心偏移标定
  *
+ * 当前状态: 随光流模块停用 (oflow.h 中 OFLOW_ENABLE = 0).
+ * 代码保留完整编译; 上位机标定命令 (NAV_CMD_CALIB_HEIGHT/OFFSET)
+ * 仅在 OFLOW_ENABLE=1 时接入 NavTask, 停用期间也可在 Keil
+ * 调试器中手动调用本模块函数. 标定不控制补光灯 (已解耦).
+ *
  * 1. 高度标定 (pix_to_m):
  *    用电机位置模式驱动 4 轮走固定圈数 (实际位移已知),
  *    同时累计光流像素, 算出 pix_to_m 比例系数.

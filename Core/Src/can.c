@@ -19,6 +19,8 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "can.h"
+#include "cmsis_os.h"
+#include "shared_vars.h"
 
 /* USER CODE BEGIN 0 */
 
@@ -164,6 +166,13 @@ void can_SendCmd(__IO uint8_t *cmd, uint8_t len)
 	static uint32_t TxMailbox; __IO uint8_t i = 0, j = 0, k = 0, l = 0, packNum = 0;
 	CAN_TxHeaderTypeDef TxMsg = {0};
 	uint8_t txData[8] = {0};
+	uint8_t locked = 0;
+
+	if ((CanTxMutexHandle != NULL) && (osKernelRunning() != 0)) {
+		if (osMutexWait(CanTxMutexHandle, osWaitForever) == osOK) {
+			locked = 1;
+		}
+	}
 
 	// 去掉ID地址和校验，数据长度
 	j = len - 2;
@@ -195,6 +204,10 @@ void can_SendCmd(__IO uint8_t *cmd, uint8_t len)
 		if (i < j) {
 			HAL_Delay(10);  // inter-frame delay for Emm_V5 RX buffer spacing (multi-frame only)
 		}
+	}
+
+	if (locked) {
+		osMutexRelease(CanTxMutexHandle);
 	}
 }
 
