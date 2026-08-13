@@ -85,20 +85,22 @@
 #define POS_PULSES_PER_REV     3200u  // 16 microstep: 3200 pulses = 1 rev
 #define POS_SLOT_COUNT         5      // number of slots
 #define POS_PULSES_PER_SLOT    (POS_PULSES_PER_REV / POS_SLOT_COUNT)  // 640 = 72 deg
-#define POS_MOVE_VEL_RPM       1000   // slot-to-slot move speed (RPM)
+#define POS_MOVE_VEL_RPM       1200   // slot-to-slot move speed (RPM)
 #define POS_MOVE_ACC           10     // acceleration gear (0 = direct start)
 #define POS_HOME_WAIT_MS       2500   // wait for power-on homing to complete
 #define POS_MOTOR_ENABLE_ON_BOOT 1   // 0=temporary zero-set mode: leave turntable motor disabled
 /* 响应等待估算 (PosMotorTask 只发不收 CAN, 无真实到位信号, 只能按时间估算):
- * 1000RPM = 6000°/s 巡航, 单槽 72° 纯巡航仅 ~12ms, 加减速+定位整定为主要开销 */
+ * 1200RPM = 7200°/s 巡航, 单槽 72° 纯巡航仅 ~10ms, 加减速+定位整定为主要开销 */
 #define POS_RESP_BASE_MS       200u   // 基础: 加减速+定位整定开销
-#define POS_RESP_PER_SLOT_MS   150u   // 每槽余量
-/* 舵机缓动参数 (ServoTask 五次多项式插值):
- * 速度 ≈ 1000/SERVO_MS_PER_DEG, 五次曲线峰值 ≈ 1.875×平均
- * 8ms/deg 时峰值 ~234°/s 过冲明显, 15ms/deg 峰值 ~125°/s 更稳 */
+#define POS_RESP_PER_SLOT_MS   130u   // 每槽余量
+/* 舵机缓动参数:
+ * 舵机1带负载抬升, 使用强前段+小尾段慢收曲线以提高带载输出;
+ * 舵机2保持五次多项式缓动, 降低末端冲击。 */
 #define SERVO_MS_PER_DEG       15u    // 每度耗时(ms), 调大=更慢更平缓
 #define SERVO_MIN_MOVE_MS      200u   // 最短移动时间
 #define SERVO_MAX_MOVE_MS      3000u  // 最长移动时间
+#define SERVO1_FAST_PHASE      0.82f  // 舵机1前82%时间完成大部分行程
+#define SERVO1_FAST_PROGRESS   0.96f  // 舵机1前段完成96%行程, 最后4%慢收尾
 #define SERVO_DEG_TO_CCR(deg)  (500u + (uint32_t)(deg) * 2000u / 270u)  // 角度(0-270°) -> 脉宽(500-2500us)
 
 /* USER CODE END PD */
@@ -169,8 +171,8 @@ osThreadId   CommTaskHandle;
 extern volatile uint8_t  g_light_pending_id;
 extern volatile uint8_t  g_light_pending_on;
 extern volatile uint8_t  g_light_pending;
-extern volatile uint8_t  g_rotate_pending_pos;
 extern volatile uint8_t  g_rotate_pending;
+extern uint8_t RotateQueue_Pop(uint8_t *pos);
 extern volatile uint8_t  g_set_zero_pending;
 extern volatile uint8_t  g_arm_pending;
 extern volatile uint8_t  g_arm_state;
@@ -183,6 +185,23 @@ extern volatile uint8_t  calib_dbg_squal;
 extern volatile uint8_t  calib_dbg_obs;
 extern volatile float    calib_dbg_total_deg;
 #endif
+
+static float servo1_loaded_ease(float t)
+{
+  if (t <= 0.0f) return 0.0f;
+  if (t >= 1.0f) return 1.0f;
+
+  if (t < SERVO1_FAST_PHASE) {
+    float s = t / SERVO1_FAST_PHASE;
+    float u = 1.0f - s;
+    return SERVO1_FAST_PROGRESS * (1.0f - u * u * u * u);
+  }
+
+  float s = (t - SERVO1_FAST_PHASE) / (1.0f - SERVO1_FAST_PHASE);
+  float tail = s * s * (3.0f - 2.0f * s);
+  return SERVO1_FAST_PROGRESS + (1.0f - SERVO1_FAST_PROGRESS) * tail;
+}
+
 /* USER CODE END Variables */
 osThreadId defaultTaskHandle;
 osThreadId MotorTaskHandle;
@@ -1058,10 +1077,10 @@ void StartServoTask(void const * argument)
   // {servo1_angle, servo2_angle} in degrees (0-270)
   static const uint16_t arm_poses[8][2] = {
       {190,  85},  // [0] power-on default pose  归位
-      {65, 145},  // [1] state 1 - TODO  圆柱体
-      {65, 145},  // [2] state 2 - TODO  奖杯地面
-      {130, 200},  // [3] state 3 - TODO 奖杯亚军
-      {135, 135},  // [4] state 4 - TODO 奖杯冠军
+      {65, 145},  // [1] state 1 - TODO  圆柱体 奖杯
+      {120, 190},  // [2] state 2 - TODO  奖杯拿起
+      {80, 165},  // [3] state 3 - TODO 奖杯亚军
+      {95, 173},  // [4] state 4 - TODO 奖杯冠军
       {135, 135},  // [5] state 5 - TODO
       {135, 135},  // [6] state 6 - TODO
       {135, 135},  // [7] state 7 - TODO
@@ -1071,8 +1090,8 @@ void StartServoTask(void const * argument)
    * 先写 CCR 再开 PWM 输出, 舵机上电直接去状态0, 不绕中位1500;
    * last_state 从 0 起, 上电不触发多余缓动, 之后状态切换才做缓动. */
 
-  /* 五次多项式缓动: q(t) = 10t^3 - 15t^4 + 6t^5, t∈[0,1]
-   * 两端速度、加速度均为 0, 动作平缓无冲击.
+  /* 舵机1: 强前段+小尾段慢收, 前段尽快给出大位置误差, 末端只留少量行程缓冲。
+   * 舵机2: 五次多项式缓动 q2(t)=10t^3-15t^4+6t^5, 两端速度/加速度为0。
    * 移动时间 ∝ 两舵机中较大的角度变化 (约125°/s), 钳位在
    * [SERVO_MIN_MOVE_MS, SERVO_MAX_MOVE_MS].
    * ARM_RESP 在缓动完成后才回, 语义 = 姿态已到位. */
@@ -1124,11 +1143,12 @@ void StartServoTask(void const * argument)
         moving = 0;
       } else {
         float t = (float)el / (float)move_dur;
-        float q = t * t * t * (t * (6.0f * t - 15.0f) + 10.0f);  // 五次缓动
+        float q1 = servo1_loaded_ease(t);                          // 舵机1强前段, 最后小行程慢收尾
+        float q2 = t * t * t * (t * (6.0f * t - 15.0f) + 10.0f);  // 舵机2五次缓动
         cur_ccr1 = (uint32_t)((int32_t)src_ccr1 +
-                   (int32_t)((float)(int32_t)(tgt_ccr1 - src_ccr1) * q));
+                   (int32_t)((float)(int32_t)(tgt_ccr1 - src_ccr1) * q1));
         cur_ccr2 = (uint32_t)((int32_t)src_ccr2 +
-                   (int32_t)((float)(int32_t)(tgt_ccr2 - src_ccr2) * q));
+                   (int32_t)((float)(int32_t)(tgt_ccr2 - src_ccr2) * q2));
       }
       __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, cur_ccr1);
       __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, cur_ccr2);
@@ -1223,8 +1243,11 @@ void StartPosMotorTask(void const * argument)
     }
 
     if (g_rotate_pending) {
-      uint8_t tgt = g_rotate_pending_pos;
-      g_rotate_pending = 0;
+      uint8_t tgt = 0;
+      if (!RotateQueue_Pop(&tgt)) {
+        osDelay(20);
+        continue;
+      }
 
 #if !POS_MOTOR_ENABLE_ON_BOOT
       SendNavResultToPC(TYPE_ROTATE_RESP, 0);
@@ -1363,6 +1386,26 @@ void StartNavTask(void const * argument)
                               * arc_r / arc_v * 1000.0f * 2.5f) + 15000UL;
           result = MoveArcTrack(arc_r, arc_v, arc_dir, arc_sweep, arc_to);
           SendNavResultToPC(TYPE_CMD_ARC_RESP, result);
+          break;
+        }
+
+        case NAV_CMD_ARC_ROTATE: {
+          /* 圆弧中按实际弧进度触发转盘切换。
+           * f[0]=半径m, f[1]=方向(+1右/-1左), f[2]=扫角°, f[3]=速度m/s,
+           * f[4]/u[0], f[5]/u[1], f[6]/u[2] = 触发角度°/槽位。 */
+          float arc_r     = nav.f[0];
+          int   arc_dir   = (nav.f[1] >= 0.0f) ? 1 : -1;
+          float arc_sweep = nav.f[2];
+          if (arc_sweep < 0.0f) arc_sweep = -arc_sweep;
+          float arc_v     = (nav.f[3] > 0.01f) ? nav.f[3] : MOVE_ARC_SPEED;
+          uint32_t arc_to = (uint32_t)((arc_sweep * 3.14159265f / 180.0f)
+                              * arc_r / arc_v * 1000.0f * 2.5f) + 15000UL;
+          result = MoveArcTrackWithTurntable(arc_r, arc_v, arc_dir, arc_sweep,
+                                             nav.f[4], nav.u[0],
+                                             nav.f[5], nav.u[1],
+                                             nav.f[6], nav.u[2],
+                                             arc_to);
+          SendNavResultToPC(TYPE_CMD_ARC_ROTATE_RESP, result);
           break;
         }
 

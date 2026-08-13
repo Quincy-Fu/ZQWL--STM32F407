@@ -30,14 +30,14 @@
 /* ================================================================
  *  路径点类型 (路径点跟踪器)
  * ================================================================ */
-#define PATH_MODE_NORMAL  0   /* 普通点: 切线跟随(MCU运行时自动算方向) */
-#define PATH_MODE_KEY     1   /* 关键点: 目标姿态角(上位机/任务指定) */
+#define PATH_MODE_NORMAL  0   /* 普通通过点: 不停, 进入通过半径后切下一段 */
+#define PATH_MODE_KEY     1   /* 关键点: 带目标姿态角, 进关键半径且姿态基本到位后切段 */
 
 typedef struct {
     float   x;            /* 场坐标 X (右) m */
     float   y;            /* 场坐标 Y (前) m */
-    float   target_theta; /* 目标姿态角 ° (CW+); mode=1时有效, mode=0时不用 */
-    uint8_t mode;         /* 0=普通(切线跟随), 1=关键点(目标姿态) */
+    float   target_theta; /* 目标姿态角 ° (CW+); mode=1时作为分段yaw目标 */
+    uint8_t mode;         /* 0=普通通过点, 1=关键点/姿态目标点 */
     uint8_t _pad[3];      /* 对齐填充 → 16B/点 */
 } PathPt_t;
 
@@ -119,19 +119,17 @@ typedef struct {
 #define MOVE_ARC_OUTWARD_COMP_K 0.06f  /* 圆弧速度相关径向外推补偿: comp=K*v²/R, 抵消高速切内圈 */
 #define MOVE_ARC_OUTWARD_COMP_MAX 0.025f /* 圆弧径向外推补偿限幅 m/s, 防止小半径/高速时过补偿 */
 
-/* 路径跟踪 (线段投影 + 横向修正 + 关键点航向) */
+/* 路径执行 (MCU内部顺序执行位置点/转角点, 稳定优先) */
 #define MOVE_WP_MAX_PTS         256    /* 路径点缓冲上限 (256×16B=4KB .bss) */
 #define MOVE_WP_END_TOL         0.010f /* 末端到位容差 m */
 #define MOVE_WP_SPEED           0.30f  /* 默认路径速度 m/s */
 #define MOVE_WP_TIMEOUT_MS      15000  /* 路径跟踪超时 ms */
+#define MOVE_WP_MOVE_DECEL_DIST 0.35f  /* path点到点减速区 m: 短于普通MoveTo的1.60m, 提高短段速度 */
 #define MOVE_WP_PASS_RADIUS     0.080f /* 普通通过点提前切段半径 m: 减少折线点停车/硬拐 */
-#define MOVE_WP_LAT_KP          0.8f   /* 横向修正增益 (误差m→修正m/s), path需保守防蛇形震荡 */
-#define MOVE_WP_LAT_MAX_RATIO   0.30f  /* 横向修正速度上限=切向速度×此比例, 防追线过猛 */
-#define MOVE_WP_SETTLE_MAX_SPEED 0.06f /* 终点位置收敛最高速度 m/s, 防到位附近来回摆 */
-#define MOVE_WP_YAW_KP          0.012f /* 航向P增益 (°→m/s轮速差) [验证甜点: 0.012+21ms=0.6稳,降值更差,非振荡] */
-#define MOVE_WP_YAW_MAX         0.30f /* 航向修正限幅 m/s [v/R×L_SUM: v=0.8,R=0.5→0.272, 留余量; 右轮=vy-wz=0.50>0不反转] */
-#define MOVE_WP_KEY_DECEL_DIST  0.15f  /* 关键点减速区 m */
-#define MOVE_WP_KEY_MIN_SPEED   0.10f  /* 关键点最低速度 m/s (给航向环收敛时间) */
+#define MOVE_WP_KEY_PASS_RADIUS 0.030f /* 关键点通过半径 m: 保证关键点精度, 过大等于切角 */
+#define MOVE_WP_YAW_KP          0.012f /* 圆弧/路径内部航向P增益 (°→m/s轮速差) */
+#define MOVE_WP_YAW_MAX         0.30f  /* 圆弧/路径内部航向修正限幅 m/s */
+#define MOVE_WP_ZERO_YAW_LIMIT  0.22f /* path重复坐标转角段限速: 略低于普通TURNTO, 兼顾速度和震荡 */
 
 /* 视觉微调 (到位后视觉闭环方向微调, 体坐标系) */
 #define MOVE_VISION_NUDGE_SPEED     0.05f  /* 微调速度 m/s (慢于Blu3 GOTO_CORRECT_SPEED 0.25, 略高于蠕动区0.04, 供视觉闭环跟踪) */
@@ -200,11 +198,19 @@ uint8_t MoveArc(float cx, float cy, float radius,
 uint8_t MoveArcTrack(float radius, float speed, int dir,
                      float sweep_deg, uint32_t timeout_ms);
 
-/* 路径跟踪 (线段投影 + 横向修正 + 起始航向保持)
+/* 圆弧轨迹跟踪，并在实际弧进度达到触发角度时下发转盘槽位切换。 */
+uint8_t MoveArcTrackWithTurntable(float radius, float speed, int dir,
+                                  float sweep_deg,
+                                  float trigger1_deg, uint8_t slot1,
+                                  float trigger2_deg, uint8_t slot2,
+                                  float trigger3_deg, uint8_t slot3,
+                                  uint32_t timeout_ms);
+
+/* 路径执行 (MCU内部顺序执行位置点/转角点)
  * 上位机发路径点(x,y,target_theta,mode) → Move_PathBegin + 多次Move_PathAddPoint 装载 →
  * NavTask调用MovePathTrack阻塞跟踪:
- *   普通点(mode=0): 线段跟踪 + 起始航向保持, 进入通过半径后不停顿切下一段
- *   关键点(mode=1): 接近时减速; 若为终点, 先位置到位再RotateTo到target_theta */
+ *   坐标不同: 调用 MoveToAccurateTimed 到目标点
+ *   坐标相同且mode=1: 调用 RotateTo 到 target_theta */
 void    Move_PathBegin(uint8_t count, float speed);                      /* ISR: 预告点数+速度, 清零缓冲 */
 void    Move_PathAddPoint(float x, float y, float target_theta, uint8_t mode); /* ISR: 追加一个路径点 */
 uint8_t MovePathTrack(void);                                             /* NavTask: 阻塞跟踪, 1=完成 0=超时/中止 */

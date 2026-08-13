@@ -63,6 +63,10 @@
 #define TYPE_CMD_IMU_CALIB             0x2D   // PC->MCU: payload 空
 #define TYPE_CMD_IMU_CALIB_RESP        0x2E   // MCU->PC: payload 1B status (1=IMU帧恢复)
 
+// 圆弧中按实际弧进度触发转盘切换
+#define TYPE_CMD_ARC_ROTATE            0x2F   // PC->MCU: arc参数 + 3个(触发角度,槽位)
+#define TYPE_CMD_ARC_ROTATE_RESP       0x30   // MCU->PC: payload 1B status
+
 // ????payload?? (3?float)
 #define PAYLOAD_SIZE_VEL         12
 // ???payload?? (3?float)
@@ -120,10 +124,12 @@ bool UartParser_FeedByte(UartParser_t* parser, uint8_t byte, uint8_t* out_type, 
 #define NAV_CMD_VISION_NUDGE 0x0E  /* 视觉微调: f[0]=direction(0=stop+lock,1=fwd,2=back,3=left,4=right) */
 #define NAV_CMD_VISION_CORRECT 0x0F /* f[0]=field dx_mm, f[1]=field dy_mm, f[2]=target_x_m, f[3]=target_y_m */
 #define NAV_CMD_IMU_CALIB  0x10   /* IMU gyro/accel zero-bias calibration, no params */
+#define NAV_CMD_ARC_ROTATE 0x11   /* f[0..3]=arc, f[4..6]=触发角度, u[0..2]=槽位 */
 
 typedef struct {
     uint8_t  cmd;
-    float    f[5];   // cmd-dependent parameters
+    float    f[8];   // cmd-dependent parameters
+    uint8_t  u[8];   // cmd-dependent byte parameters
 } NavPacket_t;
 
 // Pack a 1-byte result response frame

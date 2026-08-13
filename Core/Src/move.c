@@ -47,6 +47,7 @@ volatile uint8_t g_path_debug_en = 1;                  /* 调试帧开关: 1=开
 extern volatile float g_odom_x;        /* 里程计X, 同步用 */
 extern volatile float g_odom_y;        /* 里程计Y, 同步用 */
 extern volatile float g_odom_theta;    /* 里程计theta(CW+弧度), 同步用 */
+extern void RotateQueue_Push(uint8_t pos);    /* 圆弧过程中把转盘槽位请求加入队列 */
 /* [调试用,定位后删除] 路径跟踪遥测, 定义在freertos.c */
 extern void SendPathDebugToPC(float mx, float my, int16_t wp_idx, int16_t total,
                               float vx_f, float vy_f, float wz, float target_yaw,
@@ -65,6 +66,9 @@ static const uint8_t wheel_mirror[4] = {0, 1, 0, 1};
 static int32_t enc_last[4] = {0, 0, 0, 0};
 static bool    enc_has_last = false;
 static uint8_t arc_yaw_l_sum_active = 0; /* 1=圆弧段使用MOVE_ARC_YAW_L_SUM, 0=普通段使用MOVE_YAW_L_SUM */
+static uint8_t arc_tt_enable = 0;         /* 1=本次圆弧按进度触发转盘 */
+static float   arc_tt_deg[3] = {0.0f, 0.0f, 0.0f};
+static uint8_t arc_tt_slot[3] = {0, 0, 0};
 
 /* 每轮命令速度 (回读失败时的fallback) */
 static float cmd_wheel_rpm[4] = {0, 0, 0, 0};
@@ -83,6 +87,12 @@ static volatile uint8_t g_path_load_error = 0; /* 装载期间发现非法点/�
  * ================================================================ */
 
 static float move_abs(float v) { return v >= 0.0f ? v : -v; }
+
+static void move_arc_request_turntable(uint8_t slot)
+{
+    if (slot >= 5u) return;
+    RotateQueue_Push(slot);
+}
 
 /**
  * @brief  安全的编码器差值 (处理32位回绕)
@@ -485,8 +495,9 @@ static void move_sync_to_odom(void)
  *
  * @return 1=到位, 0=超时
  */
-uint8_t MoveToAccurateTimed(float tx, float ty, float max_speed,
-                            float tol, uint32_t timeout_ms)
+static uint8_t move_to_accurate_timed_ex(float tx, float ty, float max_speed,
+                                         float tol, uint32_t timeout_ms,
+                                         float decel_dist)
 {
     g_move_active = 1;
 
@@ -572,8 +583,8 @@ uint8_t MoveToAccurateTimed(float tx, float ty, float max_speed,
         /* 4b. 减速区: sqrt制动曲线 (第一性原理: d=v²/2a → v=√(2ad))
          *    线性减速初始减速度=2×sqrt, 电机跟不上→过冲;
          *    sqrt曲线初始减速度温和, 接近目标时自然降速, 匹配电机物理 */
-        if (dist < MOVE_DECEL_DIST) {
-            float ratio = dist / MOVE_DECEL_DIST;
+        if (decel_dist > 0.001f && dist < decel_dist) {
+            float ratio = dist / decel_dist;
             float decel = eff_max_speed * move_sqrt(ratio);
             if (decel < MOVE_MIN_SPEED) decel = MOVE_MIN_SPEED;
             if (speed > decel) speed = decel;
@@ -611,6 +622,13 @@ uint8_t MoveToAccurateTimed(float tx, float ty, float max_speed,
         /* 9. 控制环延时 */
         move_delay(MOVE_CTRL_PERIOD_MS);
     }
+}
+
+uint8_t MoveToAccurateTimed(float tx, float ty, float max_speed,
+                            float tol, uint32_t timeout_ms)
+{
+    return move_to_accurate_timed_ex(tx, ty, max_speed, tol,
+                                     timeout_ms, MOVE_DECEL_DIST);
 }
 
 uint8_t MoveTo(float tx, float ty, float max_speed)
@@ -1085,6 +1103,11 @@ uint8_t MoveArcTrack(float radius, float speed, int dir,
     dir = (dir > 0) ? 1 : -1;
     if (sweep_deg < 0.0f) sweep_deg = -sweep_deg;
 
+    uint8_t tt_enable = arc_tt_enable;
+    float tt_deg[3] = {arc_tt_deg[0], arc_tt_deg[1], arc_tt_deg[2]};
+    uint8_t tt_slot[3] = {arc_tt_slot[0], arc_tt_slot[1], arc_tt_slot[2]};
+    uint8_t tt_done[3] = {0, 0, 0};
+
     g_move_active = 1;
     arc_yaw_l_sum_active = 1;
     enc_has_last = false;
@@ -1172,6 +1195,15 @@ uint8_t MoveArcTrack(float radius, float speed, int dir,
         /* 末端减速: yaw和位置扫角任一方没跟上, 都不能按完成处理。
          * 之前只按swept_yaw减速/停止, 会出现角度到了但弧长少走, 最终位置偏左。 */
         float arc_progress = (swept_yaw < swept) ? swept_yaw : swept;
+        if (tt_enable) {
+            for (uint8_t i = 0; i < 3; i++) {
+                if (!tt_done[i] && tt_deg[i] > 0.0f && tt_deg[i] <= sweep_deg &&
+                    arc_progress >= tt_deg[i]) {
+                    move_arc_request_turntable(tt_slot[i]);
+                    tt_done[i] = 1;
+                }
+            }
+        }
         float remaining_deg = sweep_deg - arc_progress;
         float s_rem = (remaining_deg > 0.0f) ?
                       (remaining_deg * (3.14159265f / 180.0f) * radius) : 0.0f;
@@ -1184,6 +1216,14 @@ uint8_t MoveArcTrack(float radius, float speed, int dir,
         uint8_t yaw_done = (swept_yaw + predicted_overshoot >= sweep_deg);
         uint8_t pos_sweep_done = (swept + MOVE_ARC_SWEEP_TOL_DEG >= sweep_deg);
         if (yaw_done && pos_sweep_done) {
+            if (tt_enable) {
+                for (uint8_t i = 0; i < 3; i++) {
+                    if (!tt_done[i] && tt_deg[i] > 0.0f && tt_deg[i] <= sweep_deg) {
+                        move_arc_request_turntable(tt_slot[i]);
+                        tt_done[i] = 1;
+                    }
+                }
+            }
             Move_Stop();
             move_delay(100);  /* 机械惯性 settling 缓冲 */
 
@@ -1312,6 +1352,25 @@ uint8_t MoveArcTrack(float radius, float speed, int dir,
     }
 }
 
+uint8_t MoveArcTrackWithTurntable(float radius, float speed, int dir,
+                                  float sweep_deg,
+                                  float trigger1_deg, uint8_t slot1,
+                                  float trigger2_deg, uint8_t slot2,
+                                  float trigger3_deg, uint8_t slot3,
+                                  uint32_t timeout_ms)
+{
+    arc_tt_deg[0] = trigger1_deg;
+    arc_tt_deg[1] = trigger2_deg;
+    arc_tt_deg[2] = trigger3_deg;
+    arc_tt_slot[0] = slot1;
+    arc_tt_slot[1] = slot2;
+    arc_tt_slot[2] = slot3;
+    arc_tt_enable = 1;
+    uint8_t ret = MoveArcTrack(radius, speed, dir, sweep_deg, timeout_ms);
+    arc_tt_enable = 0;
+    return ret;
+}
+
 /* ================================================================
  *  控制函数 — MovePathTrack (路径跟踪)
  *
@@ -1360,31 +1419,18 @@ void Move_PathAddPoint(float x, float y, float target_theta, uint8_t mode)
 
 /* ── 路径跟踪器 ── */
 
-/* ── 路径航向保持 ───────────────────────────────────────────────
- * path 主循环只负责连续平移追线, 不在普通点按切线方向强行转头。
- * 原来的“切线跟随 + 横向追线”会让麦轮XY和yaw强耦合, 实车表现为蛇形震荡。
- * 终点需要指定角度时, 先让位置停稳, 再复用 RotateTo 单独闭环转角。
- */
-static float path_yaw_hold_ctrl(float target_yaw, float yaw)
+static float path_dist2(const PathPt_t *a, const PathPt_t *b)
 {
-    float yaw_err = target_yaw - yaw;
-    while (yaw_err >  180.0f) yaw_err -= 360.0f;
-    while (yaw_err < -180.0f) yaw_err += 360.0f;
-
-    if (move_abs(yaw_err) <= MOVE_YAW_HOLD_DEADZONE) {
-        return 0.0f;
-    }
-
-    float wz = yaw_err * MOVE_YAW_KP;
-    return move_clamp(wz, -MOVE_YAW_HOLD_LIMIT, MOVE_YAW_HOLD_LIMIT);
+    float dx = b->x - a->x;
+    float dy = b->y - a->y;
+    return dx * dx + dy * dy;
 }
 
 /**
- * @brief  路径跟踪: 线段投影 + 横向修正 + 姿态控制
+ * @brief  路径执行: MCU内部顺序执行位置点/转角点
  *
- *         投影机器人位置到当前线段 → 前进速度沿切线 +
- *         横向修正∝偏移 → 投影过末端自动切下一段。
- *         姿态: 移动中保持起始航向; 终点若为关键点, 位置到位后再单独RotateTo.
+ * 这版优先稳定性: 不再做投影追线和关键点反向拉回, 避免短线段过点后后退震荡。
+ * 坐标不同: 复用已验证的 MoveToAccurateTimed; 坐标相同且mode=KEY: 复用RotateTo。
  *
  * @return 1=完成, 0=超时/装载无效
  */
@@ -1396,167 +1442,63 @@ uint8_t MovePathTrack(void)
     if (g_path_load_error || n < 2 || n != (int)g_path_expected) return 0;
 
     float total_len = 0.0f;
+    uint8_t zero_turn_count = 0;
     for (int i = 0; i < n - 1; i++) {
         float dx = g_path_pts[i+1].x - g_path_pts[i].x;
         float dy = g_path_pts[i+1].y - g_path_pts[i].y;
-        total_len += move_sqrt(dx * dx + dy * dy);
+        float seg_len2 = dx * dx + dy * dy;
+        if (seg_len2 < 1e-8f && g_path_pts[i+1].mode == PATH_MODE_KEY) {
+            zero_turn_count++;
+        } else {
+            total_len += move_sqrt(seg_len2);
+        }
     }
+
     uint32_t path_timeout_ms = MOVE_WP_TIMEOUT_MS;
     if (speed > 0.01f && total_len > 0.001f) {
-        uint32_t dyn_to = (uint32_t)((total_len / speed) * 3000.0f) + 5000UL;
+        uint32_t dyn_to = (uint32_t)((total_len / speed) * 5000.0f)
+                        + (uint32_t)zero_turn_count * 8000UL + 12000UL;
         if (dyn_to > path_timeout_ms) path_timeout_ms = dyn_to;
     }
-
-    g_move_active = 1;
-    enc_has_last = false;
-
-    const PathPt_t *p = g_path_pts;
-    int seg = 0;                          /* 当前线段: p[seg]→p[seg+1] */
-    float path_hold_yaw = move_yaw;        /* path平移阶段保持起始航向, 防切线转头导致蛇形震荡 */
-
     uint32_t t0 = move_tick();
-    uint32_t prev_iter_tick = t0;
 
-    for (;;) {
+    for (int i = 1; i < n; i++) {
         if (move_tick() - t0 >= path_timeout_ms) {
-            Move_Stop(); move_sync_to_odom(); g_move_active = 0;
+            Move_Stop();
+            move_sync_to_odom();
+            g_move_active = 0;
             return 0;
         }
-        /* 1. 读编码器 → 里程计 */
-        int32_t cur_pos[4];
-        dbg_enc_ok = move_read_all_encoders(cur_pos);
-        move_update_odom(cur_pos);
-        float rx = move_x, ry = move_y;
 
-        /* 2. 当前线段向量 + 投影 */
-        float sdx = p[seg+1].x - p[seg].x;
-        float sdy = p[seg+1].y - p[seg].y;
-        float slen2 = sdx * sdx + sdy * sdy;
-
-        float t = 0.0f;
-        if (slen2 < 1e-8f) {
-            if (seg < n - 2) { seg++; continue; }
-            t = 1.0f;  /* 终点退化段: 直接进入终点收敛/航向检查 */
-        } else {
-            float rxr = rx - p[seg].x, ryr = ry - p[seg].y;
-            t = (rxr * sdx + ryr * sdy) / slen2;  /* [0=起点, 1=终点] */
-        }
-
-        /* 3. 普通通过点: 进入通过半径或投影越过端点即切下一段, 不停车 */
-        if (t >= 1.0f && seg < n - 2) {
-            if (p[seg+1].mode == PATH_MODE_NORMAL) {
-                seg++;
-                continue;
+        if (path_dist2(&g_path_pts[i-1], &g_path_pts[i]) < 1e-8f) {
+            if (g_path_pts[i].mode == PATH_MODE_KEY) {
+                if (!RotateTo(g_path_pts[i].target_theta, MOVE_WP_ZERO_YAW_LIMIT)) {
+                    Move_Stop();
+                    move_sync_to_odom();
+                    g_move_active = 0;
+                    return 0;
+                }
             }
-        }
-        if (seg < n - 2 && p[seg+1].mode == PATH_MODE_NORMAL) {
-            float nx = p[seg+1].x - rx;
-            float ny = p[seg+1].y - ry;
-            if (move_sqrt(nx * nx + ny * ny) <= MOVE_WP_PASS_RADIUS) {
-                seg++;
-                continue;
-            }
-        } else if (t >= 1.0f && seg < n - 2) {
-            /* 中间关键点保留为“减速通过点”: 不在单条path内停等上位机动作。
-             * 需要取放/识别停稳时, 应把路线拆成多条path, 让关键点作为终点。 */
-            seg++;
             continue;
         }
 
-        /* 4. 末段: 投影超过终点 → 朝终点直线收敛 */
-        int at_end = 0;
-        if (seg >= n - 2 && t >= 1.0f) {
-            float exx = p[n-1].x - rx, eyy = p[n-1].y - ry;
-            float dist_end = move_sqrt(exx * exx + eyy * eyy);
-            if (dist_end <= MOVE_WP_END_TOL) {
-                Move_Stop();
-                move_sync_to_odom();
-                if (p[n-1].mode != PATH_MODE_KEY) {
-                    g_move_active = 0;
-                    return 1;
-                }
-
-                float final_yaw_err = p[n-1].target_theta - move_yaw;
-                while (final_yaw_err >  180.0f) final_yaw_err -= 360.0f;
-                while (final_yaw_err < -180.0f) final_yaw_err += 360.0f;
-                if (move_abs(final_yaw_err) <= MOVE_YAW_ACCEPT_DEG) {
-                    g_move_active = 0;
-                    return 1;
-                }
-
-                enc_has_last = false;
-                uint8_t rot_ok = RotateTo(p[n-1].target_theta, MOVE_YAW_TURN_LIMIT);
-                move_sync_to_odom();
-                g_move_active = 0;
-                return rot_ok;
-            }
-            t = 1.0f;      /* 钳位: 横向误差 = 机器人→终点 */
-            at_end = 1;     /* 路径已尽: 停前进, 只靠横向修正收敛 */
+        float seg_timeout_s = 8.0f;
+        float seg_len = move_sqrt(path_dist2(&g_path_pts[i-1], &g_path_pts[i]));
+        if (speed > 0.01f) {
+            seg_timeout_s += (seg_len / speed) * 4.0f;
         }
+        uint32_t seg_timeout_ms = (uint32_t)(seg_timeout_s * 1000.0f);
 
-        /* 5. 横向误差 = 机器人位置 - 路径上最近点 */
-        float slen   = move_sqrt(slen2);
-        float inv_sl = (slen > 1e-6f) ? (1.0f / slen) : 0.0f;
-        float tx     = sdx * inv_sl;          /* 单位切线 X */
-        float ty     = sdy * inv_sl;          /* 单位切线 Y */
-        float cx     = p[seg].x + t * sdx;    /* 路径上最近点 */
-        float cy     = p[seg].y + t * sdy;
-        float ex     = rx - cx, ey = ry - cy; /* 横向误差向量 */
-        float elen   = move_sqrt(ex * ex + ey * ey);
-
-        /* 6. 前进速度: 沿切线, ramp + 末端sqrt减速 */
-        float ramp = (float)(move_tick() - t0) / (float)MOVE_RAMP_TIME_MS;
-        if (ramp > 1.0f) ramp = 1.0f;
-        float vf = speed * ramp;
-
-        if (!at_end) {
-            float rem = (1.0f - t) * slen;       /* 剩余当前段 */
-            for (int i = seg + 1; i < n - 1; i++) {
-                float dx2 = p[i+1].x - p[i].x, dy2 = p[i+1].y - p[i].y;
-                rem += move_sqrt(dx2 * dx2 + dy2 * dy2);
-            }
-            if (rem < MOVE_DECEL_DIST) {
-                float decel = speed * move_sqrt(rem / MOVE_DECEL_DIST);
-                if (decel < MOVE_MIN_SPEED) decel = MOVE_MIN_SPEED;
-                if (vf > decel) vf = decel;
-            }
-            /* 关键点减速: 接近关键点时降速, 给姿态环收敛时间 */
-            if (p[seg+1].mode == PATH_MODE_KEY) {
-                float d2k = (1.0f - t) * slen;
-                if (d2k < MOVE_WP_KEY_DECEL_DIST) {
-                    float kvf = speed * move_sqrt(d2k / MOVE_WP_KEY_DECEL_DIST);
-                    if (kvf < MOVE_WP_KEY_MIN_SPEED) kvf = MOVE_WP_KEY_MIN_SPEED;
-                    if (vf > kvf) vf = kvf;
-                }
-            }
-        } else {
-            vf = 0.0f;  /* 路径已尽: 停前进, 只靠横向修正收敛到终点 */
+        if (!move_to_accurate_timed_ex(g_path_pts[i].x, g_path_pts[i].y,
+                                       speed, MOVE_WP_END_TOL,
+                                       seg_timeout_ms, MOVE_WP_MOVE_DECEL_DIST)) {
+            Move_Stop();
+            move_sync_to_odom();
+            g_move_active = 0;
+            return 0;
         }
-
-        /* 7. 横向修正: ∝误差, 方向指向路径 */
-        float vl = elen * MOVE_WP_LAT_KP;
-        float vl_cap = at_end ? MOVE_WP_SETTLE_MAX_SPEED : (vf * MOVE_WP_LAT_MAX_RATIO);
-        if (vl > vl_cap) vl = vl_cap;
-        float inv_el = (elen > 0.001f) ? (1.0f / elen) : 0.0f;
-
-        float vx_f = vf * tx - vl * ex * inv_el;  /* 前进 + 向路径修正 */
-        float vy_f = vf * ty - vl * ey * inv_el;
-
-        /* 8. 姿态控制: 移动中只保持起始航向, 不跟随折线路径切线转头 */
-        float wz = path_yaw_hold_ctrl(path_hold_yaw, move_yaw);
-        float target_yaw = path_hold_yaw;
-
-        /* 9. 发送 */
-        uint32_t now_iter = move_tick();
-        uint16_t loop_ms  = (uint16_t)(now_iter - prev_iter_tick);
-        dbg_loop_ms = loop_ms;
-        prev_iter_tick = now_iter;
-        if (g_path_debug_en) {
-            SendPathDebugToPC(move_x, move_y, (int16_t)seg, (int16_t)n,
-                              vx_f, vy_f, wz, target_yaw, loop_ms, dbg_enc_ok);
-        }
-        Move_SetFieldVelocity(vx_f, vy_f, wz);
-        move_sync_to_odom();
-        move_delay(MOVE_CTRL_PERIOD_MS);
     }
+
+    g_move_active = 0;
+    return 1;
 }

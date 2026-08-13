@@ -77,6 +77,41 @@ volatile uint8_t g_light_pending    = 0;   // 1=new command pending
 // ROTATE command pending flag (consumed by PosMotorTask, 执行完回 TYPE_ROTATE_RESP)
 volatile uint8_t g_rotate_pending_pos = 0; // 目标槽位 0-4
 volatile uint8_t g_rotate_pending     = 0; // 1=new command pending
+volatile uint8_t g_rotate_queue[8] = {0};
+volatile uint8_t g_rotate_q_head = 0;
+volatile uint8_t g_rotate_q_tail = 0;
+
+void RotateQueue_Push(uint8_t pos)
+{
+    if (pos >= 5u) return;
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    uint8_t next = (uint8_t)((g_rotate_q_tail + 1u) & 0x07u);
+    if (next == g_rotate_q_head) {
+        g_rotate_q_head = (uint8_t)((g_rotate_q_head + 1u) & 0x07u);
+    }
+    g_rotate_queue[g_rotate_q_tail] = pos;
+    g_rotate_q_tail = next;
+    g_rotate_pending_pos = pos;
+    g_rotate_pending = 1;
+    if (!primask) __enable_irq();
+}
+
+uint8_t RotateQueue_Pop(uint8_t *pos)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    if (g_rotate_q_head == g_rotate_q_tail) {
+        g_rotate_pending = 0;
+        if (!primask) __enable_irq();
+        return 0;
+    }
+    *pos = g_rotate_queue[g_rotate_q_head];
+    g_rotate_q_head = (uint8_t)((g_rotate_q_head + 1u) & 0x07u);
+    g_rotate_pending = (g_rotate_q_head != g_rotate_q_tail) ? 1u : 0u;
+    if (!primask) __enable_irq();
+    return 1;
+}
 
 // SET_ZERO command pending flag (consumed by PosMotorTask, 执行完回 TYPE_CMD_SET_ZERO_RESP)
 volatile uint8_t g_set_zero_pending   = 0; // 1=save current turntable pos as zero to flash
@@ -107,8 +142,7 @@ static inline void dispatch_frame(uint8_t type, const uint8_t *payload, uint8_t 
         uint8_t pos = payload[0];
         if (pos < 5) {
             g_target_gear = pos;          /* LCD 显示用 */
-            g_rotate_pending_pos = pos;   /* PosMotorTask 执行+回响应 */
-            g_rotate_pending = 1;
+            RotateQueue_Push(pos);        /* PosMotorTask 执行+回响应 */
         }
     } else if (type == TYPE_ARM) {
         if (len >= 1) {
@@ -209,6 +243,26 @@ static inline void dispatch_frame(uint8_t type, const uint8_t *payload, uint8_t 
         memcpy(&nav.f[1], payload + 4, 4);
         memcpy(&nav.f[2], payload + 8, 4);
         if (len == 16) memcpy(&nav.f[3], payload + 12, 4);
+        BaseType_t h = pdFALSE;
+        xQueueSendFromISR(NavQueueHandle, &nav, &h);
+        portYIELD_FROM_ISR(h);
+        g_rx_nav_count++;
+    }
+    else if (type == TYPE_CMD_ARC_ROTATE && len == 31) {
+        /* 圆弧+转盘触发: 4个圆弧float + 3组(触发角度float, 槽位uint8)。 */
+        NavPacket_t nav;
+        memset(&nav, 0, sizeof(nav));
+        nav.cmd = NAV_CMD_ARC_ROTATE;
+        memcpy(&nav.f[0], payload, 4);       /* radius */
+        memcpy(&nav.f[1], payload + 4, 4);   /* dir */
+        memcpy(&nav.f[2], payload + 8, 4);   /* sweep */
+        memcpy(&nav.f[3], payload + 12, 4);  /* speed */
+        memcpy(&nav.f[4], payload + 16, 4);  /* trigger1_deg */
+        nav.u[0] = payload[20];              /* slot1 */
+        memcpy(&nav.f[5], payload + 21, 4);  /* trigger2_deg */
+        nav.u[1] = payload[25];              /* slot2 */
+        memcpy(&nav.f[6], payload + 26, 4);  /* trigger3_deg */
+        nav.u[2] = payload[30];              /* slot3 */
         BaseType_t h = pdFALSE;
         xQueueSendFromISR(NavQueueHandle, &nav, &h);
         portYIELD_FROM_ISR(h);
