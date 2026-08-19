@@ -50,7 +50,7 @@ void MX_CAN1_Init(void)
   hcan1.Init.TimeTriggeredMode = DISABLE;
   hcan1.Init.AutoBusOff = DISABLE;
   hcan1.Init.AutoWakeUp = DISABLE;
-  hcan1.Init.AutoRetransmission = DISABLE;
+  hcan1.Init.AutoRetransmission = ENABLE;
   hcan1.Init.ReceiveFifoLocked = DISABLE;
   hcan1.Init.TransmitFifoPriority = DISABLE;
   if (HAL_CAN_Init(&hcan1) != HAL_OK)
@@ -61,6 +61,7 @@ void MX_CAN1_Init(void)
   /* Enable AutoBusOff management (CubeMX sets DISABLE, resets on regen).
    * ABOM lets CAN auto-recover from bus-off state caused by errors. */
   CAN1->MCR |= CAN_MCR_ABOM;
+  CAN1->MCR &= ~CAN_MCR_NART;
   /* USER CODE END CAN1_Init 2 */
 
 }
@@ -198,7 +199,14 @@ void can_SendCmd(__IO uint8_t *cmd, uint8_t len)
 			for(l=0; l < 7; l++,i++) { txData[l + 1] = cmd[i + 2]; } TxMsg.DLC = 8;
 		}
 
-		while(HAL_CAN_AddTxMessage(&hcan1, (CAN_TxHeaderTypeDef *)(&TxMsg), (uint8_t *)(&txData), (&TxMailbox)) != HAL_OK);
+		/* CAN邮箱短暂忙时不要空转抢占CPU；帧内容和重试语义保持不变。 */
+		while(HAL_CAN_AddTxMessage(&hcan1, (CAN_TxHeaderTypeDef *)(&TxMsg), (uint8_t *)(&txData), (&TxMailbox)) != HAL_OK) {
+			if (osKernelRunning() != 0) {
+				osDelay(1);
+			} else {
+				HAL_Delay(1);
+			}
+		}
 
 		++packNum;
 		if (i < j) {

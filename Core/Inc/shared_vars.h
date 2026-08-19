@@ -17,9 +17,10 @@
  *  freertos.c 定义
  * ================================================================ */
 
-/* IMU 航向 (度, 上电=0°; 原始正方向由安装决定, move.c统一映射到CW正) */
-extern volatile float g_imu_yaw;       /* LPF滤波后, 诊断/校准用; 普通航向不依赖它 */
-extern volatile float g_imu_yaw_raw;  /* 无LPF, 诊断/校准用; 运动角度闭环不依赖它 */
+/* IMU 航向 (度, 上电=0°; 原始正方向由安装决定, move.c按配置映射到CW正) */
+extern volatile float g_imu_yaw;       /* LPF滤波后yaw, 启用IMU角度闭环时使用 */
+extern volatile float g_imu_yaw_raw;  /* 无LPF原始值, 诊断/校准用 */
+extern volatile uint32_t g_imu_last_tick; /* 最近一次IMU yaw更新tick */
 extern volatile uint8_t g_imu_verified;
 
 /* 里程计 (场坐标: x=右m, y=前m, theta=CW+ rad, =move_yaw×π/180) */

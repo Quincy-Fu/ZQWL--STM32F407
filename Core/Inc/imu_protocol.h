@@ -54,6 +54,7 @@ extern volatile uint8_t  imu_last_func;          /* 最近一帧的功能码 */
 extern volatile uint32_t imu_frame_count;        /* 校验通过的帧计数 */
 extern volatile uint8_t  imu_last_checksum_ok;    /* 最近一帧校验结果 */
 extern volatile uint32_t imu_rx_byte_count;      /* 收到的总字节数 (调试用) */
+extern volatile uint32_t imu_yaw_frame_count;    /* 校验通过的Euler yaw帧计数 */
 extern volatile float    imu_raw_yaw;            /* 原始 yaw (转换前, 确认单位用) */
 extern volatile uint32_t imu_return_state_count; /* IMU 命令完成/状态返回帧计数 */
 

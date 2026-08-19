@@ -14,15 +14,19 @@
 #define TYPE_ROTATE              0x03
 #define TYPE_ARM                 0x04
 #define TYPE_LIGHT               0x05
-#define TYPE_RUN                 0x06   // PC->MCU: 启动(模拟按键PD15), payload 空
-#define TYPE_RUN_RESP            0x07   // MCU->PC: 启动响应, payload 1B status
+#define TYPE_RUN                 0x06   // PC->MCU: RUN状态查询, payload 空
+#define TYPE_RUN_RESP            0x07   // MCU->PC: RUN状态响应, payload 1B status(1=PD15高电平)
 #define TYPE_ROTATE_RESP         0x08   // MCU->PC: 转盘响应(估算移动时间后), payload 1B status
 #define TYPE_ARM_RESP            0x09   // MCU->PC: 机械臂响应, payload 1B status
 #define TYPE_LIGHT_RESP          0x0A   // MCU->PC: 补光灯响应, payload 1B status
 
+// 转盘状态: 0-4 为五等分槽位; 5 为特殊状态, 对应零点顺时针 324°。
+#define ROTATE_STATE_SPECIAL_324 5u
+#define ROTATE_STATE_MAX         ROTATE_STATE_SPECIAL_324
+
 // Navigation command types (Stage 3)
 // Even = command (PC->MCU), Odd = response (MCU->PC)
-#define TYPE_CMD_GOTO            0x10
+#define TYPE_CMD_GOTO            0x10   // 8B=x/y; 12/16B=x/y/yaw[/speed] 平滑移动转角
 #define TYPE_CMD_GOTO_RESP       0x11
 #define TYPE_CMD_TOX             0x12
 #define TYPE_CMD_TOX_RESP        0x13
@@ -66,6 +70,18 @@
 // 圆弧中按实际弧进度触发转盘切换
 #define TYPE_CMD_ARC_ROTATE            0x2F   // PC->MCU: arc参数 + 3个(触发角度,槽位)
 #define TYPE_CMD_ARC_ROTATE_RESP       0x30   // MCU->PC: payload 1B status
+
+// 开环车体相对位移: 使用四轮 Emm_V5 位置模式, payload 8B = body dx_mm + body dy_mm
+#define TYPE_CMD_BODY_POS_MOVE         0x31   // PC->MCU: 车体坐标相对位移, +X右, +Y前
+#define TYPE_CMD_BODY_POS_RESP         0x32   // MCU->PC: payload 1B status (按估算时间执行完成)
+
+// C/D 专用固定连续段: -0.662,0.25,-90° -> -0.9,0.25,-69° -> 固定圆弧130°
+#define TYPE_CMD_CD_FIXED_ARC          0x33   // PC->MCU: payload 空, 触发写死C/D连续段
+#define TYPE_CMD_CD_FIXED_ARC_RESP     0x34   // MCU->PC: payload 1B status
+
+// yaw反馈源切换: payload 1B, 0=编码器, 1=IMU优先(掉线自动编码器兜底)
+#define TYPE_CMD_YAW_SOURCE            0x35   // PC->MCU: payload 1B source
+#define TYPE_CMD_YAW_SOURCE_RESP       0x36   // MCU->PC: payload 1B status
 
 // ????payload?? (3?float)
 #define PAYLOAD_SIZE_VEL         12
@@ -120,11 +136,15 @@ bool UartParser_FeedByte(UartParser_t* parser, uint8_t byte, uint8_t* out_type, 
 #define NAV_CMD_PATH       0x0A
 #define NAV_CMD_PATH_TEST  0x0B   /* 内置路径测试 (无线调试器触发, 实际走 NAV_CMD_PATH) */
 #define NAV_CMD_ARC_TRACK  0x0C   /* 圆弧轨迹跟踪: f[0]=半径m, f[1]=速度m/s, f[2]=方向(±1), f[3]=扫过角度° */
-#define NAV_CMD_RUN        0x0D   /* 启动按键模拟: PD15 脉冲500ms, 无参数, 回复 TYPE_RUN_RESP */
+#define NAV_CMD_RUN        0x0D   /* RUN状态查询: 读取PD15实体开关, 回复 TYPE_RUN_RESP */
 #define NAV_CMD_VISION_NUDGE 0x0E  /* 视觉微调: f[0]=direction(0=stop+lock,1=fwd,2=back,3=left,4=right) */
 #define NAV_CMD_VISION_CORRECT 0x0F /* f[0]=field dx_mm, f[1]=field dy_mm, f[2]=target_x_m, f[3]=target_y_m */
 #define NAV_CMD_IMU_CALIB  0x10   /* IMU gyro/accel zero-bias calibration, no params */
 #define NAV_CMD_ARC_ROTATE 0x11   /* f[0..3]=arc, f[4..6]=触发角度, u[0..2]=槽位 */
+#define NAV_CMD_BODY_POS_MOVE 0x12 /* f[0]=body dx_mm, f[1]=body dy_mm, Emm位置模式开环执行 */
+#define NAV_CMD_GOTO_YAW    0x13   /* f[0]=x, f[1]=y, f[2]=yaw, f[3]=speed; 移动中平滑转角 */
+#define NAV_CMD_CD_FIXED_ARC 0x14   /* C/D专用固定连续段, 无参数 */
+#define NAV_CMD_YAW_SOURCE   0x15   /* u[0]=0编码器, 1=IMU优先 */
 
 typedef struct {
     uint8_t  cmd;

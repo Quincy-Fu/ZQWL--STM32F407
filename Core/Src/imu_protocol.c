@@ -22,6 +22,7 @@ enum {
 
 /* 内部缓存: 只存 yaw (用户当前只需要这个) */
 static volatile float s_yaw = 0.0f;
+static volatile uint8_t s_yaw_valid = 0;
 
 /* Yaw zero reference: capture the first valid yaw as the 0-deg reference so
  * the heading reads exactly 0 deg at power-on (user requirement). */
@@ -37,6 +38,7 @@ volatile uint8_t  imu_last_func         = 0;
 volatile uint32_t imu_frame_count       = 0;
 volatile uint8_t  imu_last_checksum_ok  = 0;
 volatile uint32_t imu_rx_byte_count     = 0;   // total bytes received (debug)
+volatile uint32_t imu_yaw_frame_count   = 0;   // valid Euler yaw frames (debug)
 volatile float    imu_raw_yaw           = 0.0f; // raw yaw before conversion (debug)
 volatile uint32_t imu_return_state_count = 0;  // valid RETURN_STATE frames from IMU commands
 
@@ -95,6 +97,8 @@ static void parse_frame(uint8_t func, const uint8_t *data, uint8_t data_len)
                 }
                 /* Output in degrees, relative to power-on heading */
                 s_yaw = (s_yaw_unwrapped) * 57.2957795f;
+                s_yaw_valid = 1;
+                imu_yaw_frame_count++;
             }
             break;
         /* 其他功能码暂不解析 (用户只要 yaw, YAGNI) */
@@ -180,6 +184,7 @@ void imu_protocol_process(void)
 bool imu_protocol_get_yaw(float *out)
 {
     if (!out) return false;
+    if (!s_yaw_valid) return false;
     *out = s_yaw;
     return true;
 }
@@ -189,6 +194,7 @@ void imu_protocol_reset_yaw_zero(void)
     s_rx_read = s_rx_write;      /* discard stale frames captured before/during calibration */
     s_parser_reset_pending = 1;
     s_yaw = 0.0f;
+    s_yaw_valid = 0;
     s_yaw_zeroed = 0;
     s_yaw_offset = 0.0f;
     s_yaw_prev_raw = 0.0f;

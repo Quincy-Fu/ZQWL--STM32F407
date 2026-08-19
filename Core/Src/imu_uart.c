@@ -10,6 +10,13 @@ void imu_uart_start_rx(void)
     HAL_UART_Receive_IT(&huart1, &s_rx_byte, 1);
 }
 
+void imu_uart_restart_rx(void)
+{
+    /* 长时间无新帧时, 先中止可能卡住的HAL接收状态, 再重新挂1字节中断接收。 */
+    HAL_UART_AbortReceive(&huart1);
+    HAL_UART_Receive_IT(&huart1, &s_rx_byte, 1);
+}
+
 /* HAL 接收完成回调: USART1 收到 1 字节时调用 */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
