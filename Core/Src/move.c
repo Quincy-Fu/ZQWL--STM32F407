@@ -616,11 +616,11 @@ void Move_Stop(void)
     for (uint8_t rep = 0; rep < MOVE_STOP_SYNC_REPEATS; rep++) {
         for (uint8_t i = 0; i < 4; i++) {
             Emm_V5_Stop_Now(wheel_addr[i], true);
-            move_delay(MOVE_CMD_DELAY_MS);
+            move_delay(MOVE_STOP_CMD_DELAY_MS);
         }
-        move_delay(MOVE_CMD_DELAY_MS);
+        move_delay(MOVE_STOP_CMD_DELAY_MS);
         Emm_V5_Synchronous_motion(0x00);
-        move_delay(MOVE_CMD_DELAY_MS);
+        move_delay(MOVE_STOP_CMD_DELAY_MS);
     }
 
     for (uint8_t i = 0; i < 4; i++) {

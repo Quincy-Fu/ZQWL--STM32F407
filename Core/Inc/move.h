@@ -173,9 +173,10 @@ typedef struct {
 #define MOVE_BODY_POS_SETTLE_MS      250u   /* 位置模式估算完成后的停稳余量 */
 #define MOVE_BODY_POS_MARGIN_MS      350u   /* 加减速和驱动器处理余量 */
 #define MOVE_BODY_POS_MIN_WAIT_MS    2000u  /* 按厂家位置模式例程, 发命令后至少等待2秒 */
-#define MOVE_BODY_POS_RELEASE_MS     80u    /* 返回上位机前同步停四轮并释放位置模式残留 */
-#define MOVE_BODY_POS_EXIT_CMD_GAP_MS 10u   /* BODY_POS后切回速度模式0速时的电机间隔, 防个别电机漏收 */
-#define MOVE_BODY_POS_EXIT_SYNC_MS    30u   /* BODY_POS后切回速度模式0速前的同步等待 */
+#define MOVE_BODY_POS_RELEASE_MS     300u   /* 返回上位机前同步停四轮并释放位置模式残留 */
+#define MOVE_BODY_POS_EXIT_CMD_GAP_MS 20u   /* BODY_POS后切回速度模式0速时的电机间隔, 防个别电机漏收 */
+#define MOVE_BODY_POS_EXIT_SYNC_MS    50u   /* BODY_POS后切回速度模式0速前的同步等待 */
+#define MOVE_STOP_CMD_DELAY_MS       10u   /* 位置模式退出时逐轮停止命令的间隔 */
 #define MOVE_BODY_POS_MAX_DIST       0.50f  /* 防误发大距离开环位移 */
 #define MOVE_BODY_POS_VERIFY_MIN_RATIO 0.50f /* 回读校验: 单轮实际位移至少达到期望的50% */
 #define MOVE_BODY_POS_VERIFY_MIN_COUNTS 1000 /* 期望位移过小时不做单轮校验, 避免量化误判 */
